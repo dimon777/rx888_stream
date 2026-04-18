@@ -54,8 +54,21 @@ fn main() {
     for pid in [FX3_FIRMWARE_PID_1, FX3_FIRMWARE_PID_2] {
         if let Some(handle) = context.open_device_with_vid_pid(FX3_VID, pid) {
             println!("[*] Found RX888 in firmware mode (PID {:04x}), resetting...", pid);
-            let _ = rx888_send_command(&handle, FX3Command::RESETFX3, 0);
-            thread::sleep(Duration::from_millis(1000));
+            if pid == FX3_FIRMWARE_PID_2 {
+                // libsddc (3ddc) firmware reset command
+                let _ = handle.write_control(
+                    0x40, // Vendor Out
+                    0x01, // REGOP
+                    0,    // Register 0 (RESET)
+                    0,    // Value
+                    &0u32.to_le_bytes(),
+                    Duration::from_secs(1)
+                );
+            } else {
+                // rx888_stream (00f1) firmware reset command
+                let _ = rx888_send_command(&handle, FX3Command::RESETFX3, 0);
+            }
+            thread::sleep(Duration::from_millis(2000));
             break;
         }
     }
