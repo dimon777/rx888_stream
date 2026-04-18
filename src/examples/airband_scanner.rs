@@ -23,7 +23,8 @@ use rx888::{
 
 const FX3_VID: u16 = 0x04b4;
 const FX3_BOOTLOADER_PID: u16 = 0x00f3;
-const FX3_FIRMWARE_PID: u16 = 0x00f1;
+const FX3_FIRMWARE_PID_1: u16 = 0x00f1;
+const FX3_FIRMWARE_PID_2: u16 = 0x3ddc;
 
 #[derive(Parser)]
 struct Cli {
@@ -49,24 +50,26 @@ fn main() {
 
     // 1. Load Firmware
     println!("[*] Loading firmware: {:?}", args.firmware);
-    match context.open_device_with_vid_pid(FX3_VID, FX3_FIRMWARE_PID) {
-        Some(handle) => {
+    // 1. Reset to Bootloader if in firmware mode
+    for pid in [FX3_FIRMWARE_PID_1, FX3_FIRMWARE_PID_2] {
+        if let Some(handle) = context.open_device_with_vid_pid(FX3_VID, pid) {
+            println!("[*] Found RX888 in firmware mode (PID {:04x}), resetting...", pid);
             let _ = rx888_send_command(&handle, FX3Command::RESETFX3, 0);
-            thread::sleep(Duration::from_millis(500));
+            thread::sleep(Duration::from_millis(1000));
+            break;
         }
-        None => {}
     }
 
-    let handle = open_device_with_timeout(&context, FX3_VID, FX3_BOOTLOADER_PID, Duration::from_secs(2))
-        .expect("Could not find RX888 bootloader");
+    let handle = open_device_with_timeout(&context, FX3_VID, FX3_BOOTLOADER_PID, Duration::from_secs(5))
+        .expect("Could not find RX888 bootloader (00f3). Try re-plugging the device.");
     
     let mut fw_file = File::open(&args.firmware).expect("Could not open firmware");
     fx3::fx3_load_ram(handle, &mut fw_file).expect("Firmware load failed");
     thread::sleep(Duration::from_millis(1000));
 
-    // 2. Open Device
-    let handle = open_device_with_timeout(&context, FX3_VID, FX3_FIRMWARE_PID, Duration::from_secs(2))
-        .expect("Could not find RX888 after firmware load");
+    // 2. Open Device after loading
+    let handle = open_device_with_timeout(&context, FX3_VID, FX3_FIRMWARE_PID_1, Duration::from_secs(5))
+        .expect("Could not find RX888 after firmware load (00f1)");
     
     handle.claim_interface(0).expect("Could not claim USB interface");
 
