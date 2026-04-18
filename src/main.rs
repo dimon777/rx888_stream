@@ -1,5 +1,5 @@
-mod fx3;
-mod rx888;
+use rx888_stream::fx3;
+use rx888_stream::rx888;
 
 use std::{
     collections::VecDeque,

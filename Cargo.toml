@@ -3,8 +3,6 @@ name = "rx888_stream"
 version = "0.1.0"
 edition = "2021"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [dependencies]
 bytemuck = "1.14.0"
 clap = { version = "4.4.10", features = ["derive"] }
@@ -12,3 +10,14 @@ ctrlc = "3.4.1"
 debug_print = "1.0.0"
 rusb = "0.9.3"
 rusb-async = "0.0.1-alpha"
+rustfft = "6.1.0"
+rayon = "1.8.0"
+num-complex = "0.4.4"
+
+[[bin]]
+name = "rx888_stream"
+path = "src/main.rs"
+
+[[bin]]
+name = "airband_scanner"
+path = "src/examples/airband_scanner.rs"
