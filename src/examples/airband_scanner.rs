@@ -33,15 +33,12 @@ struct Cli {
     #[arg(short, long)]
     firmware: PathBuf,
 
-    /// Start frequency in MHz
     #[arg(short = 's', long, default_value_t = 118.0)]
     start_mhz: f64,
 
-    /// End frequency in MHz
     #[arg(short = 'e', long, default_value_t = 137.0)]
     end_mhz: f64,
 
-    /// Reporting interval in seconds
     #[arg(short = 'n', long, default_value_t = 5)]
     interval: u64,
 
@@ -50,6 +47,10 @@ struct Cli {
 
     #[arg(short, long, default_value_t = 80)]
     gain: u8,
+
+    /// Threshold in dBFS (e.g. -85.0)
+    #[arg(short = 't', long, default_value_t = -85.0)]
+    threshold: f32,
 }
 
 struct ChannelData {
@@ -62,7 +63,7 @@ fn main() {
     let args = Cli::parse();
     let context = Context::new().expect("Could not create USB context");
 
-    println!("[*] Initializing RX888 Hopper Dashboard...");
+    println!("[*] Initializing RX888 Hopper...");
     for pid in [FX3_FIRMWARE_PID_1, FX3_FIRMWARE_PID_2] {
         if let Some(handle) = context.open_device_with_vid_pid(FX3_VID, pid) {
             let _ = handle.write_control(0x40, 0x01, 0, 0, &0u32.to_le_bytes(), Duration::from_secs(1));
@@ -83,11 +84,7 @@ fn main() {
     
     handle.claim_interface(0).unwrap();
 
-    // Setup Frequency Ranges and Hopping strategy
     let mut channel_map: BTreeMap<u64, ChannelData> = BTreeMap::new();
-    let start_hz = (args.start_mhz * 1e6) as u64;
-    let end_hz = (args.end_mhz * 1e6) as u64;
-    
     let mut curr = (args.start_mhz * 1000.0) as u64;
     while curr <= (args.end_mhz * 1000.0) as u64 {
         channel_map.insert(curr * 1000, ChannelData {
@@ -98,13 +95,11 @@ fn main() {
         curr += 25; 
     }
 
-    // Determine hopping centers (one for every 10MHz of span)
     let b_width = args.end_mhz - args.start_mhz;
     let mut centers_hz = Vec::new();
     if b_width <= 10.0 {
         centers_hz.push(((args.start_mhz + args.end_mhz) / 2.0 * 1e6) as u64);
     } else {
-        // Simple strategy: start+5, start+15, etc.
         let mut c = args.start_mhz + 5.0;
         while c < args.end_mhz + 5.0 {
             centers_hz.push((c * 1e6) as u64);
@@ -112,12 +107,9 @@ fn main() {
         }
     }
 
-    println!("[*] Monitoring {} channels using {} tuner positions", channel_map.len(), centers_hz.len());
-
-    let gpio = GPIOPin::VHF_EN as u32 | GPIOPin::PGA_EN as u32;
     rx888_send_command(&handle, FX3Command::TUNERINIT, 0).unwrap();
     rx888_send_command_u64(&handle, FX3Command::TUNERTUNE, centers_hz[0]).unwrap();
-    rx888_send_command(&handle, FX3Command::GPIOFX3, gpio).unwrap();
+    rx888_send_command(&handle, FX3Command::GPIOFX3, GPIOPin::VHF_EN as u32 | GPIOPin::PGA_EN as u32).unwrap();
     rx888_send_argument(&handle, ArgumentList::R82XX_ATTENUATOR, 20).unwrap();
     rx888_send_argument(&handle, ArgumentList::R82XX_VGA, 12).unwrap();
     rx888_send_argument(&handle, ArgumentList::AD8340_VGA, (args.gain | 0x80) as u16).unwrap();
@@ -142,14 +134,14 @@ fn main() {
     let mut last_hop = Instant::now();
     let mut current_center_idx = 0;
     let sample_rate = args.sample_rate as f64;
+    let fft_norm_factor = (fft_size as f32).powi(2);
 
     while running.load(Ordering::SeqCst) {
-        // Tuner Hopping Logic
         if centers_hz.len() > 1 && last_hop.elapsed() >= Duration::from_millis(500) {
             current_center_idx = (current_center_idx + 1) % centers_hz.len();
             let _ = rx888_send_command_u64(&handle, FX3Command::TUNERTUNE, centers_hz[current_center_idx]);
             last_hop = Instant::now();
-            thread::sleep(Duration::from_millis(30)); // Settle
+            thread::sleep(Duration::from_millis(30));
         }
 
         let active_center = centers_hz[current_center_idx] as f64;
@@ -164,7 +156,6 @@ fn main() {
 
             for (freq_hz, data) in channel_map.iter_mut() {
                 let offset = *freq_hz as f64 - active_center;
-                // Only integrate if the freq is within the CURRENT 10MHz hardware filter window
                 if offset.abs() <= 5.0e6 {
                     let bin_idx = if offset >= 0.0 {
                         (offset / sample_rate * fft_size as f64) as usize
@@ -172,7 +163,7 @@ fn main() {
                         ((offset + sample_rate) / sample_rate * fft_size as f64) as usize
                     };
                     if bin_idx < fft_size {
-                        data.accumulator += buffer[bin_idx].norm_sqr();
+                        data.accumulator += buffer[bin_idx].norm_sqr() / fft_norm_factor;
                         data.count += 1;
                     }
                 }
@@ -181,23 +172,24 @@ fn main() {
 
         if last_report.elapsed().as_secs() >= args.interval {
             print!("\x1B[2J\x1B[H"); 
-            println!("=== RX888 Wideband Hopper Monitor ({} - {} MHz) ===", args.start_mhz, args.end_mhz);
+            println!("=== RX888 Wideband Hopper Dashboard ({:.1} - {:.1} MHz) ===", args.start_mhz, args.end_mhz);
             println!("Time: {} | Interval: {}s | Tuner Center: {:.1} MHz", 
                 chrono::Local::now().format("%H:%M:%S"), args.interval, active_center / 1e6);
-            println!("{:-<100}", "");
+            println!("Scale: dBFS (0.0 = Peak, -100.0 = Noise) | Threshold: {:.1}", args.threshold);
+            println!("{:-<110}", "");
 
             let mut active_count = 0;
             for (freq_hz, data) in channel_map.iter_mut() {
-                let avg_power = if data.count > 0 { data.accumulator / data.count as f32 } else { 0.0 };
-                let db = if avg_power > 0.0 { 10.0 * avg_power.log10() + 65.0 } else { 0.0 };
+                let avg_power = if data.count > 0 { data.accumulator / data.count as f32 } else { 1e-12 };
+                let db = 10.0 * avg_power.log10();
 
                 data.history.push_front(db);
                 if data.history.len() > 10 { data.history.pop_back(); }
 
-                if db > 18.0 {
+                if db > args.threshold {
                     active_count += 1;
                     let hist: String = data.history.iter()
-                        .map(|v| format!("{:>5.1}", v))
+                        .map(|v| format!("{:>6.1}", v))
                         .collect::<Vec<_>>().join(" ");
                     println!("[DETECT] {:>8.3} MHz: {}", *freq_hz as f64 / 1e6, hist);
                 }
@@ -206,17 +198,15 @@ fn main() {
             }
 
             if active_count == 0 {
-                println!("\n(Searching across {} bands... No signals over threshold)", centers_hz.len());
+                println!("\n(Scanning... No signals above {:.1} dBFS)", args.threshold);
             } else {
-                println!("\nActive Channels: {} (across {} tuner positions)", active_count, centers_hz.len());
+                println!("\nActive Channels: {} (Hopping frequency: {:.1} MHz)", active_count, active_center / 1e6);
             }
             std::io::stdout().flush().unwrap();
             last_report = Instant::now();
         }
-
         transfer_pool.submit_bulk(0x81, data).unwrap();
     }
-
     rx888_send_command(handle.as_ref(), FX3Command::STOPFX3, 0).ok();
 }
 
