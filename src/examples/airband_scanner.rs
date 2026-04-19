@@ -48,12 +48,14 @@ struct Cli {
     #[arg(short, long, default_value_t = 60)]
     gain: u8,
 
-    #[arg(short = 't', long, default_value_t = -95.0, allow_hyphen_values = true)]
+    #[arg(short = 't', long, default_value_t = -98.0, allow_hyphen_values = true)]
     threshold: f32,
 
-    /// Enable de-randomization (Try this if you see flat -40dB noise)
     #[arg(short, long, default_value_t = false)]
     randomize: bool,
+
+    #[arg(short, long, default_value_t = false)]
+    dither: bool,
 }
 
 struct ChannelData {
@@ -66,7 +68,7 @@ fn main() {
     let args = Cli::parse();
     let context = Context::new().expect("Could not create USB context");
 
-    println!("[*] Initializing RX888 Dashboard (Randomizer: {})...", args.randomize);
+    println!("[*] Initializing RX888 Dashboard (Signed Mode)...");
     for pid in [FX3_FIRMWARE_PID_1, FX3_FIRMWARE_PID_2] {
         if let Some(handle) = context.open_device_with_vid_pid(FX3_VID, pid) {
             let _ = handle.write_control(0x40, 0x01, 0, 0, &0u32.to_le_bytes(), Duration::from_secs(1));
@@ -115,6 +117,7 @@ fn main() {
     
     let mut gpio = GPIOPin::VHF_EN as u32 | GPIOPin::PGA_EN as u32;
     if args.randomize { gpio |= GPIOPin::RANDO as u32; }
+    if args.dither { gpio |= GPIOPin::DITH as u32; }
     
     rx888_send_command(&handle, FX3Command::GPIOFX3, gpio).unwrap();
     rx888_send_argument(&handle, ArgumentList::R82XX_ATTENUATOR, 20).unwrap();
@@ -154,7 +157,6 @@ fn main() {
         let active_center = centers_hz[current_center_idx] as f64;
         let mut data = transfer_pool.poll(Duration::from_secs(1)).expect("USB Timeout");
         
-        // De-randomize if requested
         if args.randomize {
             let data_u16: &mut [u16] = cast_slice_mut(&mut data);
             for i in 0..data_u16.len() {
@@ -162,14 +164,11 @@ fn main() {
             }
         }
 
-        let samples: &[u16] = cast_slice(&data);
+        let samples: &[i16] = cast_slice(&data);
 
         for chunk in samples.chunks_exact(fft_size * 2) {
             let mut buffer: Vec<Complex<f32>> = chunk.chunks_exact(2)
-                .map(|iq| Complex::new(
-                    (iq[0] as f32 - 32768.0) / 32768.0, 
-                    (iq[1] as f32 - 32768.0) / 32768.0
-                ))
+                .map(|iq| Complex::new(iq[0] as f32 / 32768.0, iq[1] as f32 / 32768.0))
                 .collect();
             fft.process(&mut buffer);
 
@@ -191,10 +190,10 @@ fn main() {
 
         if last_report.elapsed().as_secs() >= args.interval {
             print!("\x1B[2J\x1B[H"); 
-            println!("=== RX888 Dashboard ({:.1} - {:.1} MHz) ===", args.start_mhz, args.end_mhz);
+            println!("=== RX888 Wideband Dashboard ({:.1} - {:.1} MHz) ===", args.start_mhz, args.end_mhz);
             println!("Time: {} | Interval: {}s | Tuner Center: {:.1} MHz", 
                 chrono::Local::now().format("%H:%M:%S"), args.interval, active_center / 1e6);
-            println!("Scale: dBFS | Threshold: {:.1} | Randomizer: {}", args.threshold, args.randomize);
+            println!("Scale: dBFS | Threshold: {:.1} | Gain: {}", args.threshold, args.gain);
             println!("{:-<110}", "");
 
             let mut active_count = 0;
