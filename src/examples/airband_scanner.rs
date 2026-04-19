@@ -11,7 +11,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use bytemuck::cast_slice;
+use bytemuck::{cast_slice, cast_slice_mut};
 use clap::Parser;
 use rusb::{Context, UsbContext};
 use rusb_async::TransferPool;
@@ -48,9 +48,12 @@ struct Cli {
     #[arg(short, long, default_value_t = 60)]
     gain: u8,
 
-    /// Threshold in dBFS (e.g. -85.0)
-    #[arg(short = 't', long, default_value_t = -85.0, allow_hyphen_values = true)]
+    #[arg(short = 't', long, default_value_t = -95.0, allow_hyphen_values = true)]
     threshold: f32,
+
+    /// Enable de-randomization (Try this if you see flat -40dB noise)
+    #[arg(short, long, default_value_t = false)]
+    randomize: bool,
 }
 
 struct ChannelData {
@@ -63,7 +66,7 @@ fn main() {
     let args = Cli::parse();
     let context = Context::new().expect("Could not create USB context");
 
-    println!("[*] Initializing RX888 Dashboard...");
+    println!("[*] Initializing RX888 Dashboard (Randomizer: {})...", args.randomize);
     for pid in [FX3_FIRMWARE_PID_1, FX3_FIRMWARE_PID_2] {
         if let Some(handle) = context.open_device_with_vid_pid(FX3_VID, pid) {
             let _ = handle.write_control(0x40, 0x01, 0, 0, &0u32.to_le_bytes(), Duration::from_secs(1));
@@ -109,7 +112,11 @@ fn main() {
 
     rx888_send_command(&handle, FX3Command::TUNERINIT, 0).unwrap();
     rx888_send_command_u64(&handle, FX3Command::TUNERTUNE, centers_hz[0]).unwrap();
-    rx888_send_command(&handle, FX3Command::GPIOFX3, GPIOPin::VHF_EN as u32 | GPIOPin::PGA_EN as u32).unwrap();
+    
+    let mut gpio = GPIOPin::VHF_EN as u32 | GPIOPin::PGA_EN as u32;
+    if args.randomize { gpio |= GPIOPin::RANDO as u32; }
+    
+    rx888_send_command(&handle, FX3Command::GPIOFX3, gpio).unwrap();
     rx888_send_argument(&handle, ArgumentList::R82XX_ATTENUATOR, 20).unwrap();
     rx888_send_argument(&handle, ArgumentList::R82XX_VGA, 12).unwrap();
     rx888_send_argument(&handle, ArgumentList::AD8340_VGA, (args.gain | 0x80) as u16).unwrap();
@@ -145,9 +152,16 @@ fn main() {
         }
 
         let active_center = centers_hz[current_center_idx] as f64;
-        let data = transfer_pool.poll(Duration::from_secs(1)).expect("USB Timeout");
+        let mut data = transfer_pool.poll(Duration::from_secs(1)).expect("USB Timeout");
         
-        // Correctly treat samples as UNSIGNED u16 and center them at 0.0
+        // De-randomize if requested
+        if args.randomize {
+            let data_u16: &mut [u16] = cast_slice_mut(&mut data);
+            for i in 0..data_u16.len() {
+                data_u16[i] ^= 0xFFFE * (data_u16[i] & 0x1);
+            }
+        }
+
         let samples: &[u16] = cast_slice(&data);
 
         for chunk in samples.chunks_exact(fft_size * 2) {
@@ -177,10 +191,10 @@ fn main() {
 
         if last_report.elapsed().as_secs() >= args.interval {
             print!("\x1B[2J\x1B[H"); 
-            println!("=== RX888 Wideband Dashboard ({:.1} - {:.1} MHz) ===", args.start_mhz, args.end_mhz);
+            println!("=== RX888 Dashboard ({:.1} - {:.1} MHz) ===", args.start_mhz, args.end_mhz);
             println!("Time: {} | Interval: {}s | Tuner Center: {:.1} MHz", 
                 chrono::Local::now().format("%H:%M:%S"), args.interval, active_center / 1e6);
-            println!("Scale: dBFS | Threshold: {:.1} | Gain: {}", args.threshold, args.gain);
+            println!("Scale: dBFS | Threshold: {:.1} | Randomizer: {}", args.threshold, args.randomize);
             println!("{:-<110}", "");
 
             let mut active_count = 0;
