@@ -2,6 +2,7 @@ use rx888_stream::fx3;
 use rx888_stream::rx888;
 
 use std::{
+    collections::{BTreeMap, VecDeque},
     fs::File,
     path::PathBuf,
     sync::{Arc, atomic::{AtomicBool, Ordering}},
@@ -31,75 +32,82 @@ struct Cli {
     #[arg(short, long)]
     firmware: PathBuf,
 
-    #[arg(short, long, default_value_t = 127500000)]
-    center_freq: u64,
+    /// Start frequency in MHz (e.g. 118.0)
+    #[arg(short = 's', long, default_value_t = 118.0)]
+    start_mhz: f64,
+
+    /// End frequency in MHz (e.g. 137.0)
+    #[arg(short = 'e', long, default_value_t = 137.0)]
+    end_mhz: f64,
+
+    /// Reporting interval in seconds
+    #[arg(short = 'n', long, default_value_t = 5)]
+    interval: u64,
 
     #[arg(short, long, default_value_t = 32000000)]
     sample_rate: u32,
 
-    #[arg(short, long, default_value_t = 60)]
+    #[arg(short, long, default_value_t = 80)]
     gain: u8,
+}
 
-    #[arg(short, long, default_value_t = -20.0)]
-    threshold_db: f32,
+struct ChannelData {
+    history: VecDeque<f32>,
+    accumulator: f32,
+    count: u32,
 }
 
 fn main() {
     let args = Cli::parse();
     let context = Context::new().expect("Could not create USB context");
 
-    // 1. Load Firmware
-    println!("[*] Loading firmware: {:?}", args.firmware);
-    // 1. Reset to Bootloader if in firmware mode
+    // 1. Reset and Load Firmware
+    println!("[*] Initializing RX888...");
     for pid in [FX3_FIRMWARE_PID_1, FX3_FIRMWARE_PID_2] {
         if let Some(handle) = context.open_device_with_vid_pid(FX3_VID, pid) {
-            println!("[*] Found RX888 in firmware mode (PID {:04x}), resetting...", pid);
-            if pid == FX3_FIRMWARE_PID_2 {
-                // libsddc (3ddc) firmware reset command
-                let _ = handle.write_control(
-                    0x40, // Vendor Out
-                    0x01, // REGOP
-                    0,    // Register 0 (RESET)
-                    0,    // Value
-                    &0u32.to_le_bytes(),
-                    Duration::from_secs(1)
-                );
-            } else {
-                // rx888_stream (00f1) firmware reset command
-                let _ = rx888_send_command(&handle, FX3Command::RESETFX3, 0);
-            }
-            thread::sleep(Duration::from_millis(2000));
-            break;
+            let _ = handle.write_control(0x40, 0x01, 0, 0, &0u32.to_le_bytes(), Duration::from_secs(1));
+            let _ = rx888_send_command(&handle, FX3Command::RESETFX3, 0);
+            thread::sleep(Duration::from_millis(1500));
         }
     }
 
     let handle = open_device_with_timeout(&context, FX3_VID, FX3_BOOTLOADER_PID, Duration::from_secs(5))
-        .expect("Could not find RX888 bootloader (00f3). Try re-plugging the device.");
+        .expect("Could not find RX888 bootloader. Try re-plugging.");
     
     let mut fw_file = File::open(&args.firmware).expect("Could not open firmware");
     fx3::fx3_load_ram(handle, &mut fw_file).expect("Firmware load failed");
     thread::sleep(Duration::from_millis(1000));
 
-    // 2. Open Device after loading
     let handle = open_device_with_timeout(&context, FX3_VID, FX3_FIRMWARE_PID_1, Duration::from_secs(5))
-        .expect("Could not find RX888 after firmware load (00f1)");
+        .expect("Could not find RX888 after firmware load");
     
-    handle.claim_interface(0).expect("Could not claim USB interface");
+    handle.claim_interface(0).unwrap();
 
-    // 3. Configure Hardware for Airband
-    println!("[*] Initializing VHF Tuner at {} MHz...", args.center_freq as f64 / 1e6);
+    // 2. Setup Frequency and Channels
+    let center_freq_hz = ((args.start_mhz + args.end_mhz) / 2.0 * 1e6) as u64;
+    let mut channel_map: BTreeMap<u64, ChannelData> = BTreeMap::new();
     
+    let mut curr = (args.start_mhz * 1000.0) as u64;
+    let end = (args.end_mhz * 1000.0) as u64;
+    while curr <= end {
+        channel_map.insert(curr * 1000, ChannelData {
+            history: VecDeque::with_capacity(10),
+            accumulator: 0.0,
+            count: 0,
+        });
+        curr += 25; // 25kHz spacing
+    }
+
+    println!("[*] Monitoring {} channels from {} to {} MHz", channel_map.len(), args.start_mhz, args.end_mhz);
+
     let gpio = GPIOPin::VHF_EN as u32 | GPIOPin::PGA_EN as u32;
     rx888_send_command(&handle, FX3Command::TUNERINIT, 0).unwrap();
-    rx888_send_command_u64(&handle, FX3Command::TUNERTUNE, args.center_freq).unwrap();
+    rx888_send_command_u64(&handle, FX3Command::TUNERTUNE, center_freq_hz).unwrap();
     rx888_send_command(&handle, FX3Command::GPIOFX3, gpio).unwrap();
-    
-    // Set Gains (LNA=20, VGA=12 are good defaults for airband)
     rx888_send_argument(&handle, ArgumentList::R82XX_ATTENUATOR, 20).unwrap();
     rx888_send_argument(&handle, ArgumentList::R82XX_VGA, 12).unwrap();
     rx888_send_argument(&handle, ArgumentList::AD8340_VGA, (args.gain | 0x80) as u16).unwrap();
 
-    // Start Streaming
     rx888_send_command(&handle, FX3Command::STARTADC, args.sample_rate).unwrap();
     rx888_send_command(&handle, FX3Command::STARTFX3, 0).unwrap();
 
@@ -109,63 +117,77 @@ fn main() {
         transfer_pool.submit_bulk(0x81, Vec::with_capacity(131072)).unwrap();
     }
 
-    // 4. Processing Loop (FFT)
+    // 3. Processing Loop
     let fft_size = 4096;
     let mut planner = FftPlanner::new();
     let fft = planner.plan_fft_forward(fft_size);
-    
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
     ctrlc::set_handler(move || r.store(false, Ordering::SeqCst)).ok();
 
-    println!("[*] Scanning 118-137 MHz... Press Ctrl+C to stop.");
+    let mut last_report = Instant::now();
+    let sample_rate = args.sample_rate as f64;
+    let center_freq = center_freq_hz as f64;
 
     while running.load(Ordering::SeqCst) {
         let data = transfer_pool.poll(Duration::from_secs(1)).expect("USB Timeout");
         let samples: &[i16] = cast_slice(&data);
-        
-        // Process in chunks of fft_size (complex IQ)
-        // Note: RX888 outputs real samples or interleaved IQ depending on mode.
-        // In VHF mode it outputs interleaved IQ.
-        let mut buffer: Vec<Complex<f32>> = samples.chunks_exact(2)
-            .take(fft_size)
-            .map(|iq| Complex::new(iq[0] as f32 / 32768.0, iq[1] as f32 / 32768.0))
-            .collect();
 
-        if buffer.len() == fft_size {
+        // Compute FFTs for this packet
+        for chunk in samples.chunks_exact(fft_size * 2) {
+            let mut buffer: Vec<Complex<f32>> = chunk.chunks_exact(2)
+                .map(|iq| Complex::new(iq[0] as f32 / 32768.0, iq[1] as f32 / 32768.0))
+                .collect();
+
             fft.process(&mut buffer);
 
-            // Calculate power and find peaks
-            let sample_rate = args.sample_rate as f64;
-            let center_freq = args.center_freq as f64;
+            // Integrate power into channels
+            for (freq_hz, data) in channel_map.iter_mut() {
+                let offset = *freq_hz as f64 - center_freq;
+                if offset.abs() > sample_rate / 2.0 { continue; }
 
-            buffer.par_iter().enumerate().for_each(|(i, bin)| {
-                let power = bin.norm_sqr();
-                let db = 10.0 * power.log10();
-                
-                if db > args.threshold_db {
-                    // Map bin to frequency
-                    let freq_offset = if i < fft_size / 2 {
-                        (i as f64 / fft_size as f64) * sample_rate
-                    } else {
-                        ((i as f64 - fft_size as f64) / fft_size as f64) * sample_rate
-                    };
-                    
-                    let target_freq = center_freq + freq_offset;
-                    
-                    // Filter for airband range
-                    if target_freq >= 118.0e6 && target_freq <= 137.0e6 {
-                        // Only print every ~100ms or so per frequency (simplification)
-                        println!("[DETECT] {:.3} MHz | Power: {:.1} dB", target_freq / 1e6, db);
-                    }
+                let bin_idx = if offset >= 0.0 {
+                    (offset / sample_rate * fft_size as f64) as usize
+                } else {
+                    ((offset + sample_rate) / sample_rate * fft_size as f64) as usize
+                };
+
+                if bin_idx < fft_size {
+                    data.accumulator += buffer[bin_idx].norm_sqr();
+                    data.count += 1;
                 }
-            });
+            }
+        }
+
+        // 4. Report every N seconds
+        if last_report.elapsed().as_secs() >= args.interval {
+            println!("\n--- Report at {} ---", chrono::Local::now().format("%H:%M:%S"));
+            for (freq_hz, data) in channel_map.iter_mut() {
+                let avg_power = if data.count > 0 { data.accumulator / data.count as f32 } else { 0.0 };
+                let db = if avg_power > 0.0 { 10.0 * avg_power.log10() + 60.0 } else { 0.0 }; // +60 for readable scale
+
+                // Shift history: Newest to the Left
+                data.history.push_front(db);
+                if data.history.len() > 10 { data.history.pop_back(); }
+
+                // Only print if there's significant activity (e.g. above 15dB in our relative scale)
+                if db > 15.0 {
+                    let history_str: String = data.history.iter()
+                        .map(|v| format!("{:.1}", v))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    println!("[DETECT] {:.3}: {}", *freq_hz as f64 / 1e6, history_str);
+                }
+
+                data.accumulator = 0.0;
+                data.count = 0;
+            }
+            last_report = Instant::now();
         }
 
         transfer_pool.submit_bulk(0x81, data).unwrap();
     }
 
-    println!("[*] Stopping...");
     rx888_send_command(handle.as_ref(), FX3Command::STOPFX3, 0).ok();
 }
 
@@ -173,7 +195,7 @@ fn open_device_with_timeout(context: &Context, vid: u16, pid: u16, timeout: Dura
     let start = Instant::now();
     while start.elapsed() < timeout {
         if let Some(h) = context.open_device_with_vid_pid(vid, pid) { return Some(h); }
-        thread::sleep(Duration::from_millis(50));
+        thread::sleep(Duration::from_millis(100));
     }
     None
 }

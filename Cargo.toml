@@ -13,6 +13,7 @@ rusb-async = "0.0.1-alpha"
 rustfft = "6.1.0"
 rayon = "1.8.0"
 num-complex = "0.4.4"
+chrono = "0.4.31"
 
 [[bin]]
 name = "rx888_stream"
