@@ -45,10 +45,9 @@ struct Cli {
     #[arg(short, long, default_value_t = 32000000)]
     sample_rate: u32,
 
-    #[arg(short, long, default_value_t = 80)]
+    #[arg(short, long, default_value_t = 60)]
     gain: u8,
 
-    /// Threshold in dBFS (e.g. -85.0)
     #[arg(short = 't', long, default_value_t = -85.0)]
     threshold: f32,
 }
@@ -63,7 +62,7 @@ fn main() {
     let args = Cli::parse();
     let context = Context::new().expect("Could not create USB context");
 
-    println!("[*] Initializing RX888 Hopper...");
+    println!("[*] Initializing RX888 Dashboard (Unsigned Mode)...");
     for pid in [FX3_FIRMWARE_PID_1, FX3_FIRMWARE_PID_2] {
         if let Some(handle) = context.open_device_with_vid_pid(FX3_VID, pid) {
             let _ = handle.write_control(0x40, 0x01, 0, 0, &0u32.to_le_bytes(), Duration::from_secs(1));
@@ -141,16 +140,21 @@ fn main() {
             current_center_idx = (current_center_idx + 1) % centers_hz.len();
             let _ = rx888_send_command_u64(&handle, FX3Command::TUNERTUNE, centers_hz[current_center_idx]);
             last_hop = Instant::now();
-            thread::sleep(Duration::from_millis(30));
+            thread::sleep(Duration::from_millis(30)); 
         }
 
         let active_center = centers_hz[current_center_idx] as f64;
         let data = transfer_pool.poll(Duration::from_secs(1)).expect("USB Timeout");
-        let samples: &[i16] = cast_slice(&data);
+        
+        // Correctly treat samples as UNSIGNED u16 and center them at 0.0
+        let samples: &[u16] = cast_slice(&data);
 
         for chunk in samples.chunks_exact(fft_size * 2) {
             let mut buffer: Vec<Complex<f32>> = chunk.chunks_exact(2)
-                .map(|iq| Complex::new(iq[0] as f32 / 32768.0, iq[1] as f32 / 32768.0))
+                .map(|iq| Complex::new(
+                    (iq[0] as f32 - 32768.0) / 32768.0, 
+                    (iq[1] as f32 - 32768.0) / 32768.0
+                ))
                 .collect();
             fft.process(&mut buffer);
 
@@ -172,10 +176,10 @@ fn main() {
 
         if last_report.elapsed().as_secs() >= args.interval {
             print!("\x1B[2J\x1B[H"); 
-            println!("=== RX888 Wideband Hopper Dashboard ({:.1} - {:.1} MHz) ===", args.start_mhz, args.end_mhz);
+            println!("=== RX888 Wideband Dashboard ({} - {} MHz) ===", args.start_mhz, args.end_mhz);
             println!("Time: {} | Interval: {}s | Tuner Center: {:.1} MHz", 
                 chrono::Local::now().format("%H:%M:%S"), args.interval, active_center / 1e6);
-            println!("Scale: dBFS (0.0 = Peak, -100.0 = Noise) | Threshold: {:.1}", args.threshold);
+            println!("Scale: dBFS | Threshold: {:.1} | Gain: {}", args.threshold, args.gain);
             println!("{:-<110}", "");
 
             let mut active_count = 0;
@@ -200,7 +204,7 @@ fn main() {
             if active_count == 0 {
                 println!("\n(Scanning... No signals above {:.1} dBFS)", args.threshold);
             } else {
-                println!("\nActive Channels: {} (Hopping frequency: {:.1} MHz)", active_count, active_center / 1e6);
+                println!("\nActive Channels: {}", active_count);
             }
             std::io::stdout().flush().unwrap();
             last_report = Instant::now();
