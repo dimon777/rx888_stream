@@ -4,6 +4,7 @@ use rx888_stream::rx888;
 use std::{
     collections::{BTreeMap, VecDeque},
     fs::File,
+    io::Write,
     path::PathBuf,
     sync::{Arc, atomic::{AtomicBool, Ordering}},
     thread,
@@ -32,11 +33,11 @@ struct Cli {
     #[arg(short, long)]
     firmware: PathBuf,
 
-    /// Start frequency in MHz (e.g. 118.0)
+    /// Start frequency in MHz
     #[arg(short = 's', long, default_value_t = 118.0)]
     start_mhz: f64,
 
-    /// End frequency in MHz (e.g. 137.0)
+    /// End frequency in MHz
     #[arg(short = 'e', long, default_value_t = 137.0)]
     end_mhz: f64,
 
@@ -62,7 +63,7 @@ fn main() {
     let context = Context::new().expect("Could not create USB context");
 
     // 1. Reset and Load Firmware
-    println!("[*] Initializing RX888...");
+    println!("[*] Initializing RX888 Dashboard...");
     for pid in [FX3_FIRMWARE_PID_1, FX3_FIRMWARE_PID_2] {
         if let Some(handle) = context.open_device_with_vid_pid(FX3_VID, pid) {
             let _ = handle.write_control(0x40, 0x01, 0, 0, &0u32.to_le_bytes(), Duration::from_secs(1));
@@ -72,7 +73,7 @@ fn main() {
     }
 
     let handle = open_device_with_timeout(&context, FX3_VID, FX3_BOOTLOADER_PID, Duration::from_secs(5))
-        .expect("Could not find RX888 bootloader. Try re-plugging.");
+        .expect("Could not find RX888 bootloader.");
     
     let mut fw_file = File::open(&args.firmware).expect("Could not open firmware");
     fx3::fx3_load_ram(handle, &mut fw_file).expect("Firmware load failed");
@@ -95,10 +96,8 @@ fn main() {
             accumulator: 0.0,
             count: 0,
         });
-        curr += 25; // 25kHz spacing
+        curr += 25; 
     }
-
-    println!("[*] Monitoring {} channels from {} to {} MHz", channel_map.len(), args.start_mhz, args.end_mhz);
 
     let gpio = GPIOPin::VHF_EN as u32 | GPIOPin::PGA_EN as u32;
     rx888_send_command(&handle, FX3Command::TUNERINIT, 0).unwrap();
@@ -117,7 +116,7 @@ fn main() {
         transfer_pool.submit_bulk(0x81, Vec::with_capacity(131072)).unwrap();
     }
 
-    // 3. Processing Loop
+    // 3. Loop
     let fft_size = 4096;
     let mut planner = FftPlanner::new();
     let fft = planner.plan_fft_forward(fft_size);
@@ -133,25 +132,20 @@ fn main() {
         let data = transfer_pool.poll(Duration::from_secs(1)).expect("USB Timeout");
         let samples: &[i16] = cast_slice(&data);
 
-        // Compute FFTs for this packet
         for chunk in samples.chunks_exact(fft_size * 2) {
             let mut buffer: Vec<Complex<f32>> = chunk.chunks_exact(2)
                 .map(|iq| Complex::new(iq[0] as f32 / 32768.0, iq[1] as f32 / 32768.0))
                 .collect();
-
             fft.process(&mut buffer);
 
-            // Integrate power into channels
             for (freq_hz, data) in channel_map.iter_mut() {
                 let offset = *freq_hz as f64 - center_freq;
                 if offset.abs() > sample_rate / 2.0 { continue; }
-
                 let bin_idx = if offset >= 0.0 {
                     (offset / sample_rate * fft_size as f64) as usize
                 } else {
                     ((offset + sample_rate) / sample_rate * fft_size as f64) as usize
                 };
-
                 if bin_idx < fft_size {
                     data.accumulator += buffer[bin_idx].norm_sqr();
                     data.count += 1;
@@ -159,29 +153,39 @@ fn main() {
             }
         }
 
-        // 4. Report every N seconds
+        // 4. Integrated Dashboard Update
         if last_report.elapsed().as_secs() >= args.interval {
-            println!("\n--- Report at {} ---", chrono::Local::now().format("%H:%M:%S"));
+            print!("\x1B[2J\x1B[H"); // Clear and Home
+            println!("=== RX888 Airband Monitor ({} - {} MHz) ===", args.start_mhz, args.end_mhz);
+            println!("Local Time: {} | Interval: {}s | Total Channels: {}", 
+                chrono::Local::now().format("%H:%M:%S"), args.interval, channel_map.len());
+            println!("{:-<90}", "");
+
+            let mut active_count = 0;
             for (freq_hz, data) in channel_map.iter_mut() {
                 let avg_power = if data.count > 0 { data.accumulator / data.count as f32 } else { 0.0 };
-                let db = if avg_power > 0.0 { 10.0 * avg_power.log10() + 60.0 } else { 0.0 }; // +60 for readable scale
+                let db = if avg_power > 0.0 { 10.0 * avg_power.log10() + 60.0 } else { 0.0 };
 
-                // Shift history: Newest to the Left
                 data.history.push_front(db);
                 if data.history.len() > 10 { data.history.pop_back(); }
 
-                // Only print if there's significant activity (e.g. above 15dB in our relative scale)
                 if db > 15.0 {
-                    let history_str: String = data.history.iter()
-                        .map(|v| format!("{:.1}", v))
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    println!("[DETECT] {:.3}: {}", *freq_hz as f64 / 1e6, history_str);
+                    active_count += 1;
+                    let hist: String = data.history.iter()
+                        .map(|v| format!("{:>5.1}", v))
+                        .collect::<Vec<_>>().join(" ");
+                    println!("[DETECT] {:>8.3} MHz: {}", *freq_hz as f64 / 1e6, hist);
                 }
-
                 data.accumulator = 0.0;
                 data.count = 0;
             }
+
+            if active_count == 0 {
+                println!("\n(Searching... No signals exceeding threshold)");
+            } else {
+                println!("\nActive Channels: {}", active_count);
+            }
+            std::io::stdout().flush().unwrap();
             last_report = Instant::now();
         }
 
