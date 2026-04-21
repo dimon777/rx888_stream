@@ -23,96 +23,57 @@ use rx888::{
     GPIOPin,
 };
 
-const FX3_VID: u16 = 0x04b4;
-const FX3_BOOTLOADER_PID: u16 = 0x00f3;
-const FX3_FIRMWARE_PID_1: u16 = 0x00f1;
-const FX3_FIRMWARE_PID_2: u16 = 0x3ddc;
-
-#[derive(Parser, Clone)]
+#[derive(Parser)]
 struct Cli {
-    #[arg(short, long)]
-    firmware: PathBuf,
-
-    #[arg(short = 's', long, default_value_t = 118.0)]
-    start_mhz: f64,
-
-    #[arg(short = 'e', long, default_value_t = 120.0)]
-    end_mhz: f64,
-
-    #[arg(short, long, default_value_t = 32000000)]
-    sample_rate: u32,
-
-    #[arg(short, long, default_value_t = 30)]
-    gain: u8,
-
-    #[arg(long, default_value_t = 10)]
-    vhf_lna: u16,
-
-    #[arg(long, default_value_t = 5)]
-    vhf_vga: u16,
-
-    #[arg(short, long, default_value_t = 20)]
-    attenuation: u16,
-
-    #[arg(short = 't', long, default_value_t = -95.0, allow_hyphen_values = true)]
-    threshold: f32,
-
-    #[arg(short = 'i', long, default_value_t = 0.0)]
-    if_mhz: f64,
-
-    #[arg(short, long, default_value_t = false)]
-    randomize: bool,
-    
-    /// Save 1 second of raw data to 'debug_dump.bin'
-    #[arg(long, default_value_t = false)]
-    dump: bool,
+    #[arg(short, long)] firmware: PathBuf,
+    #[arg(short = 's', long, default_value_t = 118.0)] start_mhz: f64,
+    #[arg(short = 'e', long, default_value_t = 120.0)] end_mhz: f64,
+    #[arg(short, long, default_value_t = 32000000)] sample_rate: u32,
+    #[arg(short, long, default_value_t = 30)] gain: u8,
+    #[arg(long, default_value_t = 10)] vhf_lna: u16,
+    #[arg(long, default_value_t = 5)] vhf_vga: u16,
+    #[arg(short, long, default_value_t = 20)] attenuation: u16,
+    #[arg(short = 't', long, default_value_t = -95.0, allow_hyphen_values = true)] threshold: f32,
+    #[arg(short = 'i', long, default_value_t = 0.0)] if_mhz: f64,
+    #[arg(short, long, default_value_t = false)] randomize: bool,
 }
 
-struct ChannelState {
-    accumulator: f32,
-    count: u32,
-}
-
-fn power_to_dots(db: f32) -> String {
-    let min_db = -115.0;
-    let max_db = -15.0;
-    let width = 45;
-    if db < min_db { return "...".to_string(); }
-    let normalized = ((db - min_db) / (max_db - min_db)).clamp(0.0, 1.0);
-    let dot_count = (normalized * width as f32) as usize;
-    ".".repeat(dot_count.max(3))
+fn power_to_char(db: f32) -> char {
+    if db > -40.0 { '#' }
+    else if db > -60.0 { '=' }
+    else if db > -80.0 { '-' }
+    else if db > -95.0 { '.' }
+    else { ' ' }
 }
 
 fn main() {
     let args = Cli::parse();
-    let context = Context::new().unwrap();
+    let context = Context::new().expect("USB failed");
     
     // Auto-Reset
-    for pid in [FX3_FIRMWARE_PID_1, FX3_FIRMWARE_PID_2] {
-        if let Some(handle) = context.open_device_with_vid_pid(FX3_VID, pid) {
-            let _ = rx888_send_command(&handle, FX3Command::RESETFX3, 0);
+    for pid in [0x00f1, 0x3ddc] {
+        if let Some(h) = context.open_device_with_vid_pid(0x04b4, pid) {
+            let _ = rx888_send_command(&h, FX3Command::RESETFX3, 0);
             thread::sleep(Duration::from_millis(1500));
         }
     }
 
-    let handle = open_device_with_timeout(&context, FX3_VID, FX3_BOOTLOADER_PID, Duration::from_secs(5)).unwrap();
-    let mut fw_file = File::open(&args.firmware).unwrap();
-    fx3::fx3_load_ram(handle, &mut fw_file).unwrap();
+    let h = open_device_with_timeout(&context, 0x04b4, 0x00f3, Duration::from_secs(5)).expect("No bootloader");
+    fx3::fx3_load_ram(h, &mut File::open(&args.firmware).unwrap()).unwrap();
     thread::sleep(Duration::from_millis(1000));
-    let handle = open_device_with_timeout(&context, FX3_VID, FX3_FIRMWARE_PID_1, Duration::from_secs(5)).unwrap();
+    let handle = open_device_with_timeout(&context, 0x04b4, 0x00f1, Duration::from_secs(5)).unwrap();
     handle.claim_interface(0).unwrap();
 
     let center_freq_hz = ((args.start_mhz + args.end_mhz) / 2.0 * 1e6) as u64;
     let mut current_if_hz = args.if_mhz * 1e6;
-    
-    let mut channel_map: BTreeMap<u64, ChannelState> = BTreeMap::new();
+    let mut channel_map: BTreeMap<u64, (f32, u32)> = BTreeMap::new();
     let mut curr_mhz = args.start_mhz;
     while curr_mhz <= args.end_mhz {
-        channel_map.insert((curr_mhz * 1e6) as u64, ChannelState { accumulator: 0.0, count: 0 });
+        channel_map.insert((curr_mhz * 1e6) as u64, (0.0, 0));
         curr_mhz += 0.025; 
     }
 
-    // HW SETUP
+    // EXACT MATCH TO MAIN TOOL
     rx888_send_command(&handle, FX3Command::TUNERSTDBY, 0).ok();
     let mut gpio = GPIOPin::VHF_EN as u32 | GPIOPin::PGA_EN as u32;
     if args.randomize { gpio |= GPIOPin::RANDO as u32; }
@@ -121,23 +82,23 @@ fn main() {
     rx888_send_command_u64(&handle, FX3Command::TUNERTUNE, center_freq_hz).unwrap();
     rx888_send_argument(&handle, ArgumentList::R82XX_ATTENUATOR, args.vhf_lna).unwrap();
     rx888_send_argument(&handle, ArgumentList::R82XX_VGA, args.vhf_vga).unwrap();
+    rx888_send_argument(&handle, ArgumentList::R82XX_SIDEBAND, 0).ok(); 
+    rx888_send_argument(&handle, ArgumentList::R82XX_HARMONIC, 0).ok();
     rx888_send_argument(&handle, ArgumentList::DAT31_ATT, args.attenuation).unwrap();
     rx888_send_argument(&handle, ArgumentList::AD8340_VGA, (args.gain as u16) | 0x80).unwrap();
     rx888_send_command(&handle, FX3Command::STARTADC, args.sample_rate).unwrap();
     rx888_send_command(&handle, FX3Command::STARTFX3, 0).unwrap();
 
     let handle = Arc::new(handle);
-    let mut transfer_pool = TransferPool::new(handle.clone()).unwrap();
-    let packet_size = 16384; // SMALLER PACKETS LIKE ORIGINAL
-    for _ in 0..128 { transfer_pool.submit_bulk(0x81, Vec::with_capacity(packet_size)).unwrap(); }
+    let mut transfer_pool = rusb_async::TransferPool::new(handle.clone()).unwrap();
+    for _ in 0..64 { transfer_pool.submit_bulk(0x81, Vec::with_capacity(16384)).unwrap(); }
 
     let fft_size = 4096;
     let mut planner = FftPlanner::new();
     let fft = planner.plan_fft_forward(fft_size);
     let window: Vec<f32> = (0..fft_size).map(|i| {
-        let a0 = 0.35875; let a1 = 0.48829; let a2 = 0.14128; let a3 = 0.01168;
         let t = (2.0 * std::f32::consts::PI * i as f32) / (fft_size - 1) as f32;
-        a0 - a1 * t.cos() + a2 * (2.0 * t).cos() - a3 * (3.0 * t).cos()
+        0.35875 - 0.48829 * t.cos() + 0.14128 * (2.0 * t).cos() - 0.01168 * (3.0 * t).cos()
     }).collect();
 
     let running = Arc::new(AtomicBool::new(true));
@@ -146,17 +107,11 @@ fn main() {
 
     let mut last_ui_update = Instant::now();
     let sample_rate = args.sample_rate as f64;
-    let fft_norm_factor = (fft_size as f32).powi(2) * 0.15;
-    
-    let mut wide_accumulator = vec![0.0f32; fft_size / 2];
-    let mut wide_count = 0;
+    let fft_norm = (fft_size as f32).powi(2) * 0.15;
+    let mut wide_acc = vec![0.0f32; fft_size / 2];
+    let mut wide_cnt = 0;
     let start_time = Instant::now();
     let mut auto_locked = (args.if_mhz != 0.0);
-    
-    let mut dump_file = if args.dump { Some(File::create("debug_dump.bin").unwrap()) } else { None };
-    let mut dump_count = 0;
-
-    let mut samples_buffer: Vec<i16> = Vec::with_capacity(65536);
 
     while running.load(Ordering::SeqCst) {
         let mut data = transfer_pool.poll(Duration::from_secs(1)).expect("USB Timeout");
@@ -164,90 +119,65 @@ fn main() {
             let d_u16: &mut [u16] = cast_slice_mut(&mut data);
             for x in d_u16 { *x ^= 0xFFFE * (*x & 0x1); }
         }
-        
-        if let Some(ref mut f) = dump_file {
-            if dump_count < args.sample_rate * 2 {
-                f.write_all(&data).ok();
-                dump_count += data.len() as u32;
-            } else {
-                println!("\n[INFO] Debug dump complete (debug_dump.bin)");
-                dump_file = None;
-            }
-        }
+        let samples: &[i16] = cast_slice(&data);
 
-        samples_buffer.extend_from_slice(cast_slice(&data));
-        
-        while samples_buffer.len() >= fft_size {
-            let chunk: Vec<i16> = samples_buffer.drain(0..fft_size).collect();
+        for chunk in samples.chunks_exact(fft_size) {
             let mut buf: Vec<Complex<f32>> = chunk.iter().enumerate()
-                .map(|(i, &s)| Complex::new((s as f32 / 32768.0) * window[i], 0.0))
-                .collect();
+                .map(|(i, &s)| Complex::new((s as f32 / 32768.0) * window[i], 0.0)).collect();
             fft.process(&mut buf);
-
-            wide_count += 1;
-            for i in 0..(fft_size / 2) { wide_accumulator[i] += buf[i].norm_sqr() / fft_norm_factor; }
-
+            wide_cnt += 1;
+            for i in 0..(fft_size / 2) { wide_acc[i] += buf[i].norm_sqr() / fft_norm; }
             if auto_locked {
                 for (freq_hz, state) in channel_map.iter_mut() {
-                    let rel_offset = *freq_hz as f64 - center_freq_hz as f64;
-                    let target_freq = (current_if_hz + rel_offset).abs();
-                    let bin_idx = (target_freq / (sample_rate / 2.0) * (fft_size as f64 / 2.0)) as usize;
-                    if bin_idx < fft_size / 2 {
-                        state.accumulator += buf[bin_idx].norm_sqr() / fft_norm_factor;
-                        state.count += 1;
-                    }
+                    let rel = *freq_hz as f64 - center_freq_hz as f64;
+                    let bin = ((current_if_hz + rel).abs() / (sample_rate / 2.0) * (fft_size as f64 / 2.0)) as usize;
+                    if bin < fft_size / 2 { state.0 += buf[bin].norm_sqr() / fft_norm; state.1 += 1; }
                 }
             }
         }
 
         if last_ui_update.elapsed() >= Duration::from_millis(200) {
-            let mut peaks: Vec<(usize, f32)> = wide_accumulator.iter().enumerate()
-                .skip(40) // skip DC
-                .map(|(i, &p)| (i, 10.0 * (p / wide_count as f32).log10()))
-                .collect();
-            peaks.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-            
+            let mut pks: Vec<(usize, f32)> = wide_acc.iter().enumerate().skip(40)
+                .map(|(i, &p)| (i, 10.0 * (p / wide_cnt as f32).log10())).collect();
+            pks.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
             if !auto_locked && start_time.elapsed().as_secs() >= 3 {
-                if let Some((idx, _)) = peaks.get(0) {
-                    current_if_hz = (*idx as f64 / (fft_size as f64 / 2.0)) * (sample_rate / 2.0);
-                    auto_locked = true;
-                }
+                if let Some(p) = pks.get(0) { current_if_hz = (p.0 as f64 / (fft_size as f64 / 2.0)) * (sample_rate / 2.0); auto_locked = true; }
             }
-
-            print!("\x1B[2J\x1B[H"); 
-            println!("=== RX888 Diagnostic Monitor (Range: {:.1} MHz) ===", (args.end_mhz - args.start_mhz));
-            print!("Top Peaks: ");
-            for (i, db) in peaks.iter().take(3) {
-                let f = (*i as f64 / (fft_size as f64 / 2.0)) * (sample_rate / 2.0);
-                print!("| {:.3} MHz ({:.1} dB) ", f / 1e6, db);
+            print!("\x1B[2J\x1B[H");
+            println!("=== RX888 Waterfall Monitor ({:.1} MHz) ===", (args.end_mhz - args.start_mhz));
+            // Waterfall View
+            print!("0MHz [");
+            for i in 0..64 {
+                let bin_start = i * (fft_size / 2) / 64;
+                let bin_end = (i + 1) * (fft_size / 2) / 64;
+                let mut max_db = -120.0;
+                for b in bin_start..bin_end { if b < wide_acc.len() { max_db = max_db.max(10.0 * (wide_acc[b] / wide_cnt as f32).log10()); } }
+                print!("{}", power_to_char(max_db));
             }
-            println!("|");
-            println!("Status: {} | Detected IF: {:.3} MHz", if auto_locked { "LOCKED" } else { "TUNING..." }, current_if_hz / 1e6);
-            println!("{:-<110}", "");
-
+            println!("] 16MHz");
+            
+            println!("IF: {:.3} MHz | Status: {} | Peaks: {:.2} ({:.1}dB)", current_if_hz / 1e6, if auto_locked { "LOCKED" } else { "TUNING" }, pks[0].0 as f32 * (sample_rate as f32 / 4096.0) / 1e6, pks[0].1);
+            println!("{:-<86}", "");
             if auto_locked {
-                for (freq_hz, state) in channel_map.iter_mut() {
-                    let db = if state.count > 0 { 10.0 * (state.accumulator / state.count as f32).log10() } else { -120.0 };
+                for (f_hz, s) in channel_map.iter_mut() {
+                    let db = if s.1 > 0 { 10.0 * (s.0 / s.1 as f32).log10() } else { -120.0 };
                     if db > args.threshold {
-                        println!("{:>8.3} MHz: {:<48} {:>6.1} dB", *freq_hz as f64 / 1e6, power_to_dots(db), db);
+                        println!("{:>8.3} MHz: {:<40} {:>5.1} dB", *f_hz as f64 / 1e6, ".".repeat(((db+110.0)*0.5).max(1.0) as usize), db);
                     }
-                    state.accumulator = 0.0; state.count = 0;
+                    s.0 = 0.0; s.1 = 0;
                 }
             }
-            std::io::stdout().flush().unwrap();
+            std::io::stdout().flush().ok();
             last_ui_update = Instant::now();
-            if !auto_locked { wide_accumulator.fill(0.0); wide_count = 0; }
+            if !auto_locked { wide_acc.fill(0.0); wide_cnt = 0; }
         }
         transfer_pool.submit_bulk(0x81, data).unwrap();
     }
     rx888_send_command(handle.as_ref(), FX3Command::STOPFX3, 0).ok();
 }
 
-fn open_device_with_timeout(context: &Context, vid: u16, pid: u16, timeout: Duration) -> Option<rusb::DeviceHandle<Context>> {
-    let start = Instant::now();
-    while start.elapsed() < timeout {
-        if let Some(h) = context.open_device_with_vid_pid(vid, pid) { return Some(h); }
-        thread::sleep(Duration::from_millis(100));
-    }
+fn open_device_with_timeout(ctx: &rusb::Context, vid: u16, pid: u16, timeout: Duration) -> Option<rusb::DeviceHandle<rusb::Context>> {
+    let s = Instant::now();
+    while s.elapsed() < timeout { if let Some(h) = ctx.open_device_with_vid_pid(vid, pid) { return Some(h); } thread::sleep(Duration::from_millis(100)); }
     None
 }
