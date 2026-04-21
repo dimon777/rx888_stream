@@ -89,6 +89,13 @@ const CMD_SETSAMPLERATE: u8 = 0x08;
 /// Arm the FX3 to start streaming IQ data in VHF (tuner) mode.
 const CMD_STARTADC_VHF: u8 = 0x06;
 
+/// Reset the FX3 and get back into bootloader mode.
+const CMD_RESETFX3: u8 = 0xB1;
+
+/// Alternative PIDs used by various firmware versions.
+const PID_FIRMWARE_OLD: u16 = 0x00F1; // Original rx888_stream PID
+const PID_FIRMWARE_SDDC: u16 = 0x0011; // SDDC-style PID used in this scanner
+
 /// USB control transfer: vendor class, host-to-device, no interface/endpoint.
 const REQ_TYPE_WRITE: u8 = 0x40;
 
@@ -690,6 +697,18 @@ fn main() {
     };
 
     if !args.running {
+        // If the bootloader isn't visible, try to reset the device from firmware mode
+        if ctx.open_device_with_vid_pid(RX888_VID, FX3_BOOT_PID).is_none() {
+            for pid in [PID_FIRMWARE_SDDC, PID_FIRMWARE_OLD, 0x3DDC] {
+                if let Some(h) = ctx.open_device_with_vid_pid(RX888_VID, pid) {
+                    eprintln!("[*] Found active device (PID={:#06x}), resetting to bootloader...", pid);
+                    let _ = h.write_control(REQ_TYPE_WRITE, CMD_RESETFX3, 0, 0, &[], Duration::from_secs(1));
+                    std::thread::sleep(Duration::from_millis(1500));
+                    break;
+                }
+            }
+        }
+
         if let Err(e) = upload_firmware(&ctx, &args.firmware) {
             eprintln!("Error: {}", e);
             std::process::exit(1);
