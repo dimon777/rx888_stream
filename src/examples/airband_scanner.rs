@@ -63,7 +63,7 @@ struct ChannelState {
 
 fn power_to_dots(db: f32) -> String {
     let min_db = -100.0;
-    let max_db = -30.0;
+    let max_db = -25.0;
     let width = 50;
     
     if db < min_db { return "...".to_string(); }
@@ -76,7 +76,6 @@ fn power_to_dots(db: f32) -> String {
 fn main() {
     let args = Cli::parse();
     
-    // 1. Validate Range (10MHz Max)
     let span = args.end_mhz - args.start_mhz;
     if span <= 0.0 || span > 10.0 {
         eprintln!("Error: Scan range must be between 0 and 10.0 MHz (Requested: {:.1} MHz)", span);
@@ -106,7 +105,6 @@ fn main() {
     
     handle.claim_interface(0).unwrap();
 
-    // 2. Setup Channels
     let center_freq_hz = ((args.start_mhz + args.end_mhz) / 2.0 * 1e6) as u64;
     let mut channel_map: BTreeMap<u64, ChannelState> = BTreeMap::new();
     let mut curr_mhz = args.start_mhz;
@@ -119,7 +117,6 @@ fn main() {
         curr_mhz += 0.025; 
     }
 
-    // Hardware init
     rx888_send_command(&handle, FX3Command::TUNERINIT, 0).unwrap();
     rx888_send_command_u64(&handle, FX3Command::TUNERTUNE, center_freq_hz).unwrap();
     
@@ -161,7 +158,6 @@ fn main() {
 
         let samples: &[i16] = cast_slice(&data);
 
-        // Process FFTs and accumulate power
         for chunk in samples.chunks_exact(fft_size * 2) {
             let mut buf: Vec<Complex<f32>> = chunk.chunks_exact(2)
                 .map(|iq| Complex::new(iq[0] as f32 / 32768.0, iq[1] as f32 / 32768.0))
@@ -182,13 +178,12 @@ fn main() {
             }
         }
 
-        // 3. UI Update (Fast 200ms interval for "realtime" bars)
         if last_ui_update.elapsed() >= Duration::from_millis(200) {
             print!("\x1B[2J\x1B[H"); 
             println!("=== RX888 Real-time Airband Monitor ({:.3} - {:.3} MHz) ===", args.start_mhz, args.end_mhz);
             println!("Time: {} | Channels: {} | Gain: {} | Squelch: {:.1}", 
                 chrono::Local::now().format("%H:%M:%S"), channel_map.len(), args.gain, args.threshold);
-            println!("{:-<100}", "");
+            println!("{:-<110}", "");
 
             let mut active_count = 0;
             for (freq_hz, state) in channel_map.iter_mut() {
@@ -196,10 +191,13 @@ fn main() {
                 let db = 10.0 * avg_power.log10();
                 state.last_db = db;
 
-                // Only show active channels to avoid scrolling (unless terminal is huge)
                 if db > args.threshold {
                     active_count += 1;
-                    println!("{:>8.3} MHz: {}", *freq_hz as f64 / 1e6, power_to_dots(db));
+                    // Aligned dots followed by the dB value
+                    println!("{:>8.3} MHz: {:<52} {:>5.1} dB", 
+                        *freq_hz as f64 / 1e6, 
+                        power_to_dots(db), 
+                        db);
                 }
 
                 state.accumulator = 0.0;
