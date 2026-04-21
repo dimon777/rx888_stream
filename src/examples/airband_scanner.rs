@@ -26,7 +26,7 @@ use rx888::{
 struct Cli {
     #[arg(short, long)] firmware: PathBuf,
     #[arg(short = 's', long, default_value_t = 133.0)] start_mhz: f64,
-    #[arg(short = 'e', long, default_value_t = 133.5)] end_mhz: f64,
+    #[arg(short = 'e', long, default_value_t = 133.2)] end_mhz: f64,
     #[arg(short, long, default_value_t = 32000000)] sample_rate: u32,
     #[arg(short, long, default_value_t = 40)] gain: u8,
     #[arg(long, default_value_t = 25)] vhf_lna: u16,
@@ -62,7 +62,7 @@ fn main() {
     let handle = open_device_with_timeout(&context, 0x04b4, 0x00f1, Duration::from_secs(5)).unwrap();
     handle.claim_interface(0).unwrap();
 
-    let tuner_freq_hz = (args.start_mhz * 1e6) as u64; // Tune directly to start freq to minimize offset
+    let tuner_freq_hz = (args.start_mhz * 1e6) as u64; 
     let mut channel_map: BTreeMap<u64, (f32, u32)> = BTreeMap::new();
     let mut curr_mhz = args.start_mhz;
     while curr_mhz <= args.end_mhz {
@@ -73,12 +73,12 @@ fn main() {
     // --- HARDWARE LOCK SEQUENCE ---
     rx888_send_command(&handle, FX3Command::TUNERSTDBY, 0).ok();
     thread::sleep(Duration::from_millis(200));
-    rx888_send_command(&handle, FX3Command::STARTADC, args.sample_rate).ok(); // Set Clock Early
+    rx888_send_command(&handle, FX3Command::STARTADC, args.sample_rate).ok();
     thread::sleep(Duration::from_millis(200));
     rx888_send_command(&handle, FX3Command::TUNERINIT, 0).ok();
     rx888_send_command_u64(&handle, FX3Command::TUNERTUNE, tuner_freq_hz).ok();
     
-    let gpio = (GPIOPin::VHF_EN as u32) | (1 << 5); // VHF_EN + SHDWN
+    let gpio = (GPIOPin::VHF_EN as u32) | (1 << 5); 
     rx888_send_command(&handle, FX3Command::GPIOFX3, gpio).ok();
 
     rx888_send_argument(&handle, ArgumentList::R82XX_ATTENUATOR, args.vhf_lna).ok();
@@ -105,6 +105,7 @@ fn main() {
     ctrlc::set_handler(move || r.store(false, Ordering::SeqCst)).ok();
 
     let mut last_ui_update = Instant::now();
+    let start_time = Instant::now();
     let sample_rate = args.sample_rate as f64;
     let fft_norm = (fft_size as f32).powi(2) * 0.15;
     let mut wide_acc = vec![0.0f32; fft_size / 2];
@@ -114,7 +115,6 @@ fn main() {
 
     while running.load(Ordering::SeqCst) {
         let mut data = transfer_pool.poll(Duration::from_secs(1)).expect("USB Timeout");
-        // De-randomize (Match main tool)
         let d_u16: &mut [u16] = cast_slice_mut(&mut data);
         for x in d_u16 { *x ^= 0xFFFE * (*x & 0x1); }
         let samples: &[i16] = cast_slice(&data);
@@ -127,7 +127,7 @@ fn main() {
             for (i, p) in wide_acc.iter_mut().enumerate() { *p += buf[i].norm_sqr() / fft_norm; }
             if auto_locked {
                 for (freq_hz, (acc, cnt)) in channel_map.iter_mut() {
-                    let rel = ( *freq_hz as f64 - tuner_freq_hz as f64).abs();
+                    let rel = (*freq_hz as f64 - tuner_freq_hz as f64).abs();
                     let bin = ((current_if_hz + rel) / (sample_rate / 2.0) * (fft_size as f64 / 2.0)) as usize;
                     if bin < fft_size / 2 { *acc += buf[bin].norm_sqr() / fft_norm; *cnt += 1; }
                 }
@@ -143,7 +143,7 @@ fn main() {
                 if let Some(p) = pks.get(0) { current_if_hz = (p.0 as f64 / (fft_size as f64 / 2.0)) * (sample_rate / 2.0); auto_locked = true; }
             }
             
-            print!("\x1B[2J\x1B[H");
+            print!("\x1B[2J\x1B[H"); 
             println!("=== RX888 Final Locked Monitor ({:.3} - {:.3} MHz) ===", args.start_mhz, args.end_mhz);
             print!("Waterfall: [");
             for i in 0..64 {
@@ -157,7 +157,7 @@ fn main() {
             let strongest_f = (pks[0].0 as f64 / (fft_size as f64 / 2.0)) * (sample_rate / 2.0);
             println!("Status: {} | Tuner Lock: {:.3} MHz | Strongest Peak: {:.3} MHz ({:.1} dB)", 
                 if auto_locked { "LOCKED" } else { "TUNING" }, tuner_freq_hz as f64 / 1e6, strongest_f / 1e6, pks[0].1);
-            println!("{:-<105}", "");
+            println!("{:-<110}", "");
             if auto_locked {
                 for (f_hz, (acc, cnt)) in channel_map.iter_mut() {
                     let db = if *cnt > 0 { 10.0 * (*acc / *cnt as f32).log10() } else { -120.0 };
