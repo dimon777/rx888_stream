@@ -33,7 +33,7 @@ struct Cli {
     #[arg(long, default_value_t = 5)] vhf_vga: u16,
     #[arg(short, long, default_value_t = 20)] attenuation: u16,
     #[arg(short = 't', long, default_value_t = -95.0, allow_hyphen_values = true)] threshold: f32,
-    #[arg(short = 'i', long, default_value_t = 10.4)] if_mhz: f64,
+    #[arg(short = 'i', long, default_value_t = 3.57)] if_mhz: f64,
 }
 
 fn power_to_char(db: f32) -> char {
@@ -71,7 +71,7 @@ fn main() {
         curr_mhz += 0.025; 
     }
 
-    // --- SEQUENTIAL HARDWARE SYNC (MATCHING MAIN.RS EXACTLY) ---
+    // --- SEQUENTIAL HARDWARE POWER-ON ---
     rx888_send_command(&handle, FX3Command::TUNERSTDBY, 0).ok();
     thread::sleep(Duration::from_millis(100));
 
@@ -81,8 +81,8 @@ fn main() {
     rx888_send_argument(&handle, ArgumentList::R82XX_ATTENUATOR, args.vhf_lna).ok();
     rx888_send_argument(&handle, ArgumentList::R82XX_VGA, args.vhf_vga).ok();
 
-    // Turn on ONLY VHF_EN (Removed PGA_EN which was causing mute on r2 hardware)
-    let gpio = GPIOPin::VHF_EN as u32; 
+    // POWER FIX: Set VHF_EN (Bit 15) AND SHDWN (Bit 5). Bit 5 must be 1 to power up the tuner!
+    let gpio = (GPIOPin::VHF_EN as u32) | (1 << 5) | (1 << 16); // Bits 15, 5, and 16 (PGA_EN)
     rx888_send_command(&handle, FX3Command::GPIOFX3, gpio).ok();
 
     rx888_send_argument(&handle, ArgumentList::DAT31_ATT, args.attenuation).ok();
@@ -117,7 +117,6 @@ fn main() {
 
     while running.load(Ordering::SeqCst) {
         let mut data = transfer_pool.poll(Duration::from_secs(1)).expect("USB Timeout");
-        // Process as REAL
         let samples: &[i16] = cast_slice(&data);
 
         for chunk in samples.chunks_exact(fft_size) {
@@ -140,12 +139,12 @@ fn main() {
                 .map(|(i, &p)| (i, 10.0 * (p / wide_cnt as f32).log10())).collect();
             pks.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
             
-            if !auto_locked && start_time.elapsed().as_secs() >= 2 {
+            if !auto_locked && start_time.elapsed().as_secs() >= 3 {
                 if let Some(p) = pks.get(0) { current_if_hz = (p.0 as f64 / (fft_size as f64 / 2.0)) * (sample_rate / 2.0); auto_locked = true; }
             }
             
             print!("\x1B[2J\x1B[H");
-            println!("=== RX888 Final Monitor ({:.3} - {:.3} MHz) ===", args.start_mhz, args.end_mhz);
+            println!("=== RX888 Final Monitor (GPIO-Fixed) ===");
             print!("Waterfall: [");
             for i in 0..64 {
                 let bin_start = i * (fft_size / 2) / 64;
