@@ -33,8 +33,7 @@ struct Cli {
     #[arg(long, default_value_t = 5)] vhf_vga: u16,
     #[arg(short, long, default_value_t = 20)] attenuation: u16,
     #[arg(short = 't', long, default_value_t = -95.0, allow_hyphen_values = true)] threshold: f32,
-    #[arg(short = 'i', long, default_value_t = 0.0)] if_mhz: f64,
-    #[arg(short, long, default_value_t = false)] randomize: bool,
+    #[arg(short = 'i', long, default_value_t = 10.4)] if_mhz: f64,
 }
 
 fn power_to_char(db: f32) -> char {
@@ -49,7 +48,7 @@ fn main() {
     let args = Cli::parse();
     let context = Context::new().expect("USB failed");
     
-    // Hard Reset sequence
+    // Auto-Reset
     for pid in [0x00f1, 0x3ddc] {
         if let Some(h) = context.open_device_with_vid_pid(0x04b4, pid) {
             let _ = rx888_send_command(&h, FX3Command::RESETFX3, 0);
@@ -76,28 +75,25 @@ fn main() {
     rx888_send_command(&handle, FX3Command::TUNERSTDBY, 0).ok();
     thread::sleep(Duration::from_millis(100));
 
-    rx888_send_command(&handle, FX3Command::TUNERINIT, 0).unwrap();
-    rx888_send_command_u64(&handle, FX3Command::TUNERTUNE, center_freq_hz).unwrap();
+    rx888_send_command(&handle, FX3Command::TUNERINIT, 0).ok();
+    rx888_send_command_u64(&handle, FX3Command::TUNERTUNE, center_freq_hz).ok();
     
-    rx888_send_argument(&handle, ArgumentList::R82XX_ATTENUATOR, args.vhf_lna).unwrap();
-    rx888_send_argument(&handle, ArgumentList::R82XX_VGA, args.vhf_vga).unwrap();
-    rx888_send_argument(&handle, ArgumentList::R82XX_SIDEBAND, 0).ok(); 
-    rx888_send_argument(&handle, ArgumentList::R82XX_HARMONIC, 0).ok();
+    rx888_send_argument(&handle, ArgumentList::R82XX_ATTENUATOR, args.vhf_lna).ok();
+    rx888_send_argument(&handle, ArgumentList::R82XX_VGA, args.vhf_vga).ok();
 
-    // NOW turn on the antenna path (VHF_EN)
-    let mut gpio = GPIOPin::VHF_EN as u32 | GPIOPin::PGA_EN as u32;
-    if args.randomize { gpio |= GPIOPin::RANDO as u32; }
-    rx888_send_command(&handle, FX3Command::GPIOFX3, gpio).unwrap();
+    // Turn on ONLY VHF_EN (Removed PGA_EN which was causing mute on r2 hardware)
+    let gpio = GPIOPin::VHF_EN as u32; 
+    rx888_send_command(&handle, FX3Command::GPIOFX3, gpio).ok();
 
-    rx888_send_argument(&handle, ArgumentList::DAT31_ATT, args.attenuation).unwrap();
-    rx888_send_argument(&handle, ArgumentList::AD8340_VGA, (args.gain as u16) | 0x80).unwrap();
+    rx888_send_argument(&handle, ArgumentList::DAT31_ATT, args.attenuation).ok();
+    rx888_send_argument(&handle, ArgumentList::AD8340_VGA, (args.gain as u16) | 0x80).ok();
 
-    rx888_send_command(&handle, FX3Command::STARTADC, args.sample_rate).unwrap();
-    rx888_send_command(&handle, FX3Command::STARTFX3, 0).unwrap();
+    rx888_send_command(&handle, FX3Command::STARTADC, args.sample_rate).ok();
+    rx888_send_command(&handle, FX3Command::STARTFX3, 0).ok();
 
     let handle_arc = Arc::new(handle);
     let mut transfer_pool = rusb_async::TransferPool::new(handle_arc.clone()).unwrap();
-    for _ in 0..128 { transfer_pool.submit_bulk(0x81, Vec::with_capacity(16384)).unwrap(); }
+    for _ in 0..64 { transfer_pool.submit_bulk(0x81, Vec::with_capacity(16384)).unwrap(); }
 
     let fft_size = 4096;
     let mut planner = FftPlanner::new();
@@ -117,21 +113,14 @@ fn main() {
     let mut wide_acc = vec![0.0f32; fft_size / 2];
     let mut wide_cnt = 0;
     let start_time = Instant::now();
-    let mut auto_locked = args.if_mhz != 0.0;
-
-    let mut raw_buffer = Vec::with_capacity(131072);
+    let mut auto_locked = false;
 
     while running.load(Ordering::SeqCst) {
         let mut data = transfer_pool.poll(Duration::from_secs(1)).expect("USB Timeout");
-        if args.randomize {
-            let d_u16: &mut [u16] = cast_slice_mut(&mut data);
-            for x in d_u16 { *x ^= 0xFFFE * (*x & 0x1); }
-        }
-        
-        raw_buffer.extend_from_slice(cast_slice::<u8, i16>(&data));
+        // Process as REAL
+        let samples: &[i16] = cast_slice(&data);
 
-        while raw_buffer.len() >= fft_size {
-            let chunk: Vec<i16> = raw_buffer.drain(0..fft_size).collect();
+        for chunk in samples.chunks_exact(fft_size) {
             let mut buf: Vec<Complex<f32>> = chunk.iter().enumerate()
                 .map(|(i, &s)| Complex::new((s as f32 / 32768.0) * window[i], 0.0)).collect();
             fft.process(&mut buf);
@@ -151,13 +140,13 @@ fn main() {
                 .map(|(i, &p)| (i, 10.0 * (p / wide_cnt as f32).log10())).collect();
             pks.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
             
-            if !auto_locked && start_time.elapsed().as_secs() >= 3 {
+            if !auto_locked && start_time.elapsed().as_secs() >= 2 {
                 if let Some(p) = pks.get(0) { current_if_hz = (p.0 as f64 / (fft_size as f64 / 2.0)) * (sample_rate / 2.0); auto_locked = true; }
             }
             
             print!("\x1B[2J\x1B[H");
-            println!("=== RX888 Real-Time Monitor (Span: {:.1} MHz) ===", (args.end_mhz - args.start_mhz));
-            print!("0MHz [");
+            println!("=== RX888 Final Monitor ({:.3} - {:.3} MHz) ===", args.start_mhz, args.end_mhz);
+            print!("Waterfall: [");
             for i in 0..64 {
                 let bin_start = i * (fft_size / 2) / 64;
                 let bin_end = (i + 1) * (fft_size / 2) / 64;
@@ -165,10 +154,10 @@ fn main() {
                 for b in bin_start..bin_end { if b < wide_acc.len() { max_db = max_db.max(10.0 * (wide_acc[b] / (wide_cnt as f32)).log10()); } }
                 print!("{}", power_to_char(max_db));
             }
-            println!("] 16MHz");
+            println!("]");
             
-            println!("IF: {:.3} MHz | Status: {} | Max Peak: {:.1} dB", current_if_hz / 1e6, if auto_locked { "LOCKED" } else { "TUNING" }, pks[0].1);
-            println!("{:-<86}", "");
+            println!("IF Offset: {:.3} MHz | Status: {} | Peak Power: {:.1} dB", current_if_hz / 1e6, if auto_locked { "LOCKED" } else { "TUNING" }, pks[0].1);
+            println!("{:-<100}", "");
             if auto_locked {
                 for (f_hz, s) in channel_map.iter_mut() {
                     let db = if s.1 > 0 { 10.0 * (s.0 / s.1 as f32).log10() } else { -120.0 };
