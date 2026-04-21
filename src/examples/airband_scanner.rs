@@ -52,8 +52,11 @@ use clap::Parser;
 use num_complex::Complex;
 use rustfft::FftPlanner;
 
+use rx888_stream::fx3;
+use rx888_stream::rx888::{self, FX3Command, ArgumentList, GPIOPin};
+
 // ── rusb re-exported by rx888_stream (same dependency) ──────────────────────
-use rusb::{Context, DeviceHandle, UsbContext};
+use rusb::{Context, UsbContext};
 
 // ╔══════════════════════════════════════════════════════════════════════════╗
 // ║  Hardware / protocol constants                                           ║
@@ -61,40 +64,15 @@ use rusb::{Context, DeviceHandle, UsbContext};
 
 /// USB vendor ID shared by all Cypress FX3-based SDDC devices.
 const RX888_VID: u16 = 0x04B4;
-/// Product ID after SDDC firmware has been loaded onto the FX3.
-const RX888_PID: u16 = 0x0011;
-/// Product ID of the bare Cypress FX3 ROM bootloader (before firmware upload).
+/// Product ID after firmware has been loaded.
+const RX888_PID: u16 = 0x00F1;
+/// Product ID of the bare Cypress FX3 ROM bootloader.
 const FX3_BOOT_PID: u16 = 0x00F3;
 
 /// Bulk-IN endpoint carrying the raw sample stream.
 const EP_BULK_IN: u8 = 0x81;
 
-// ── SDDC / BBRF103 / RX888 vendor USB command codes ─────────────────────────
-// Derived from the public ExtIO_sddc firmware and compatible implementations
-// (e.g. fventuri/libsddc, PhantomSDR). These values match the command bytes
-// used by the rx888_stream HF/VHF streaming paths.
-
-/// Halt the FX3 and put the RF chain into reset.
-const CMD_STOPFX3: u8 = 0x02;
-/// Initialise the R820T2/R828D VHF tuner via I²C.
-const CMD_TUNERINIT: u8 = 0x0A;
-/// Tune the VHF front-end (centre frequency, little-endian u64 in data stage).
-const CMD_TUNERTUNE: u8 = 0x03;
-/// Set tuner IF gain (wValue = gain in tenths of dB).
-const CMD_TUNERGAIN: u8 = 0x04;
-/// Enable/disable tuner antenna bias-tee power (wValue = 1/0).
-const CMD_TUNERANTENNAPOWER: u8 = 0x05;
-/// Program the ADC sample rate (little-endian u32 in data stage).
-const CMD_SETSAMPLERATE: u8 = 0x08;
-/// Arm the FX3 to start streaming IQ data in VHF (tuner) mode.
-const CMD_STARTADC_VHF: u8 = 0x06;
-
-/// Reset the FX3 and get back into bootloader mode.
-const CMD_RESETFX3: u8 = 0xB1;
-
-/// Alternative PIDs used by various firmware versions.
-const PID_FIRMWARE_OLD: u16 = 0x00F1; // Original rx888_stream PID
-const PID_FIRMWARE_SDDC: u16 = 0x0011; // SDDC-style PID used in this scanner
+// Command codes are now handled via rx888_stream::rx888::FX3Command
 
 /// USB control transfer: vendor class, host-to-device, no interface/endpoint.
 const REQ_TYPE_WRITE: u8 = 0x40;
@@ -190,7 +168,7 @@ struct Args {
 // ╚══════════════════════════════════════════════════════════════════════════╝
 
 struct Rx888 {
-    handle: DeviceHandle<Context>,
+    handle: rusb::DeviceHandle<Context>,
 }
 
 impl Rx888 {
@@ -200,74 +178,55 @@ impl Rx888 {
             .open_device_with_vid_pid(RX888_VID, RX888_PID)
             .ok_or_else(|| {
                 format!(
-                    "RX888 not found (VID={:#06x} PID={:#06x}). \
-                     Is the device plugged in and firmware loaded?",
+                    "RX888 not found (VID={:#06x} PID={:#06x}).",
                     RX888_VID, RX888_PID
                 )
             })?;
         Ok(Rx888 { handle })
     }
 
-    // ── Low-level control helpers ────────────────────────────────────────────
+    // ── RF configuration using library helpers ───────────────────────────────
 
-    fn ctrl_write(&self, cmd: u8, value: u16, index: u16) -> Result<(), String> {
-        self.handle
-            .write_control(REQ_TYPE_WRITE, cmd, value, index, &[], Duration::from_secs(2))
-            .map(|_| ())
-            .map_err(|e| format!("USB ctrl write cmd={:#04x}: {}", cmd, e))
-    }
-
-    fn ctrl_write_data(
-        &self,
-        cmd: u8,
-        value: u16,
-        index: u16,
-        data: &[u8],
-    ) -> Result<(), String> {
-        self.handle
-            .write_control(REQ_TYPE_WRITE, cmd, value, index, data, Duration::from_secs(2))
-            .map(|_| ())
-            .map_err(|e| format!("USB ctrl write-data cmd={:#04x}: {}", cmd, e))
-    }
-
-    // ── RF configuration ─────────────────────────────────────────────────────
-
-    /// Initialise the R820T2/R828D VHF tuner.
     fn tuner_init(&self) -> Result<(), String> {
-        self.ctrl_write(CMD_TUNERINIT, 0, 0)?;
-        std::thread::sleep(Duration::from_millis(20));
+        rx888::rx888_send_command(&self.handle, FX3Command::TUNERINIT, 0)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    fn set_frequency(&self, freq_hz: u64) -> Result<(), String> {
+        rx888::rx888_send_command_u64(&self.handle, FX3Command::TUNERTUNE, freq_hz)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    fn set_sample_rate(&self, rate_hz: u32) -> Result<(), String> {
+        rx888::rx888_send_command(&self.handle, FX3Command::STARTADC, rate_hz)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    fn set_gain_and_attenuation(&self, gain: u16, att: u16) -> Result<(), String> {
+        // High gain mode (0x80)
+        rx888::rx888_send_argument(&self.handle, ArgumentList::AD8340_VGA, gain | 0x80)
+            .map_err(|e| e.to_string())?;
+        rx888::rx888_send_argument(&self.handle, ArgumentList::DAT31_ATT, att)
+            .map_err(|e| e.to_string())?;
         Ok(())
     }
 
-    /// Set the VHF tuner centre frequency (Hz).
-    /// The SDDC firmware expects a little-endian u64 in the data stage.
-    fn set_frequency(&self, freq_hz: u64) -> Result<(), String> {
-        self.ctrl_write_data(CMD_TUNERTUNE, 0, 0, &freq_hz.to_le_bytes())
-    }
-
-    /// Set the ADC / streaming sample rate (Hz, little-endian u32).
-    fn set_sample_rate(&self, rate_hz: u32) -> Result<(), String> {
-        self.ctrl_write_data(CMD_SETSAMPLERATE, 0, 0, &rate_hz.to_le_bytes())
-    }
-
-    /// Set tuner IF gain (tenths of dB, 0–490).
-    fn set_gain(&self, gain_tenths_db: u16) -> Result<(), String> {
-        self.ctrl_write(CMD_TUNERGAIN, gain_tenths_db, 0)
-    }
-
-    /// Enable or disable the VHF antenna bias-tee (active antenna power).
-    fn set_bias_tee(&self, on: bool) -> Result<(), String> {
-        self.ctrl_write(CMD_TUNERANTENNAPOWER, u16::from(on), 0)
-    }
-
-    /// Start the FX3 IQ stream in VHF (tuner) mode.
     fn start_streaming(&self) -> Result<(), String> {
-        self.ctrl_write(CMD_STARTADC_VHF, 0, 0)
+        let gpio = GPIOPin::VHF_EN as u32;
+        rx888::rx888_send_command(&self.handle, FX3Command::GPIOFX3, gpio)
+            .map_err(|e| e.to_string())?;
+        rx888::rx888_send_command(&self.handle, FX3Command::STARTFX3, 0)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
     }
 
-    /// Stop the FX3 IQ stream.
     fn stop_streaming(&self) -> Result<(), String> {
-        self.ctrl_write(CMD_STOPFX3, 0, 0)
+        rx888::rx888_send_command(&self.handle, FX3Command::STOPFX3, 0)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -285,37 +244,19 @@ impl Rx888 {
 /// The `.img` file format used by SDDC/rx888_stream is a raw flat binary
 /// starting at FX3 internal RAM address 0x00000000.
 fn upload_firmware(ctx: &Context, path: &str) -> Result<(), String> {
-    let firmware =
-        std::fs::read(path).map_err(|e| format!("Cannot read '{}': {}", path, e))?;
+    let mut fw_file = std::fs::File::open(path).map_err(|e| format!("Cannot read '{}': {}", path, e))?;
 
     let handle = ctx
         .open_device_with_vid_pid(RX888_VID, FX3_BOOT_PID)
         .ok_or_else(|| {
             format!(
-                "FX3 bootloader not found (PID={:#06x}). \
-                 Is the device connected and in bootloader mode?",
+                "FX3 bootloader not found (PID={:#06x}).",
                 FX3_BOOT_PID
             )
         })?;
 
-    eprintln!("[*] Uploading firmware ({} bytes) ...", firmware.len());
-
-    const PAGE: usize = 4096;
-    let mut addr: u32 = 0;
-
-    for chunk in firmware.chunks(PAGE) {
-        let wvalue = (addr & 0x0000_FFFF) as u16;
-        let windex = ((addr >> 16) & 0x0000_FFFF) as u16;
-        handle
-            .write_control(0x40, 0xA0, wvalue, windex, chunk, Duration::from_secs(3))
-            .map_err(|e| format!("Firmware upload at addr {:#010x}: {}", addr, e))?;
-        addr += chunk.len() as u32;
-    }
-
-    // Zero-length write to addr 0 → start execution.
-    handle
-        .write_control(0x40, 0xA0, 0, 0, &[], Duration::from_secs(3))
-        .map_err(|e| format!("Firmware execution trigger: {}", e))?;
+    eprintln!("[*] Uploading firmware from '{}' ...", path);
+    fx3::fx3_load_ram(handle, &mut fw_file).map_err(|e| format!("Firmware upload failed: {}", e))?;
 
     eprintln!("[*] Firmware uploaded — waiting for re-enumeration ...");
     std::thread::sleep(Duration::from_millis(2500));
@@ -528,13 +469,13 @@ fn scanner_loop(
     // raw pointer.  We guarantee the scanner_loop (and therefore `device`)
     // lives longer than this thread via the explicit `thread.join()` at the
     // bottom of this function.
-    let handle_ptr = &device.handle as *const DeviceHandle<Context> as usize;
+    let handle_ptr = &device.handle as *const rusb::DeviceHandle<Context> as usize;
 
     let reader = std::thread::spawn(move || {
         // Reconstruct the reference from the raw pointer.
         // SAFETY: see comment above — the original `Rx888` is alive.
-        let handle: &DeviceHandle<Context> =
-            unsafe { &*(handle_ptr as *const DeviceHandle<Context>) };
+        let handle: &rusb::DeviceHandle<Context> =
+            unsafe { &*(handle_ptr as *const rusb::DeviceHandle<Context>) };
 
         let mut xfer_buf = vec![0u8; TRANSFER_SIZE];
         let max_ring = SAMPLE_RATE as usize * 4; // cap ring at 4 s of samples
@@ -699,10 +640,10 @@ fn main() {
     if !args.running {
         // If the bootloader isn't visible, try to reset the device from firmware mode
         if ctx.open_device_with_vid_pid(RX888_VID, FX3_BOOT_PID).is_none() {
-            for pid in [PID_FIRMWARE_SDDC, PID_FIRMWARE_OLD, 0x3DDC] {
+            for pid in [RX888_PID, 0x0011, 0x3DDC] {
                 if let Some(h) = ctx.open_device_with_vid_pid(RX888_VID, pid) {
                     eprintln!("[*] Found active device (PID={:#06x}), resetting to bootloader...", pid);
-                    let _ = h.write_control(REQ_TYPE_WRITE, CMD_RESETFX3, 0, 0, &[], Duration::from_secs(1));
+                    let _ = rx888::rx888_send_command(&h, rx888::FX3Command::RESETFX3, 0);
                     std::thread::sleep(Duration::from_millis(1500));
                     break;
                 }
@@ -733,8 +674,7 @@ fn main() {
         ("Init tuner",      device.tuner_init()),
         ("Set sample rate", device.set_sample_rate(SAMPLE_RATE as u32)),
         ("Set frequency",   device.set_frequency(center_hz)),
-        ("Set gain",        device.set_gain(args.gain)),
-        ("Bias-tee",        device.set_bias_tee(args.bias_tee)),
+        ("Set gain/att",    device.set_gain_and_attenuation(args.gain, 0)),
         ("Start stream",    device.start_streaming()),
     ];
     for (name, result) in steps {
