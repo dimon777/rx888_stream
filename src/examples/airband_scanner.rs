@@ -26,7 +26,7 @@ use rx888::{
 struct Cli {
     #[arg(short, long)] firmware: PathBuf,
     #[arg(short = 's', long, default_value_t = 133.0)] start_mhz: f64,
-    #[arg(short = 'e', long, default_value_t = 133.2)] end_mhz: f64,
+    #[arg(short = 'e', long, default_value_t = 133.5)] end_mhz: f64,
     #[arg(short, long, default_value_t = 32000000)] sample_rate: u32,
     #[arg(short, long, default_value_t = 40)] gain: u8,
     #[arg(long, default_value_t = 25)] vhf_lna: u16,
@@ -48,7 +48,6 @@ fn main() {
     let args = Cli::parse();
     let context = Context::new().expect("USB failed");
     
-    // Recovery reset
     for pid in [0x00f1, 0x3ddc] {
         if let Some(h) = context.open_device_with_vid_pid(0x04b4, pid) {
             let _ = rx888_send_command(&h, FX3Command::RESETFX3, 0);
@@ -70,16 +69,16 @@ fn main() {
         curr_mhz += 0.025; 
     }
 
-    // --- HARDWARE LOCK SEQUENCE ---
+    println!("[*] Syncing Tuner...");
     rx888_send_command(&handle, FX3Command::TUNERSTDBY, 0).ok();
     thread::sleep(Duration::from_millis(200));
-    rx888_send_command(&handle, FX3Command::STARTADC, args.sample_rate).ok();
-    thread::sleep(Duration::from_millis(200));
     rx888_send_command(&handle, FX3Command::TUNERINIT, 0).ok();
+    thread::sleep(Duration::from_millis(200));
     rx888_send_command_u64(&handle, FX3Command::TUNERTUNE, tuner_freq_hz).ok();
+    thread::sleep(Duration::from_millis(200));
     
-    let gpio = (GPIOPin::VHF_EN as u32) | (1 << 5); 
-    rx888_send_command(&handle, FX3Command::GPIOFX3, gpio).ok();
+    rx888_send_command(&handle, FX3Command::GPIOFX3, GPIOPin::VHF_EN as u32).ok();
+    thread::sleep(Duration::from_millis(100));
 
     rx888_send_argument(&handle, ArgumentList::R82XX_ATTENUATOR, args.vhf_lna).ok();
     rx888_send_argument(&handle, ArgumentList::R82XX_VGA, args.vhf_vga).ok();
@@ -89,9 +88,11 @@ fn main() {
     rx888_send_command(&handle, FX3Command::STARTADC, args.sample_rate).ok();
     rx888_send_command(&handle, FX3Command::STARTFX3, 0).ok();
 
+    println!("[*] Stream Active.");
+
     let handle_arc = Arc::new(handle);
     let mut transfer_pool = rusb_async::TransferPool::new(handle_arc.clone()).unwrap();
-    for _ in 0..128 { transfer_pool.submit_bulk(0x81, Vec::with_capacity(16384)).unwrap(); }
+    for _ in 0..64 { transfer_pool.submit_bulk(0x81, Vec::with_capacity(16384)).unwrap(); }
 
     let fft_size = 4096;
     let mut fft = FftPlanner::new().plan_fft_forward(fft_size);
@@ -139,12 +140,12 @@ fn main() {
                 .map(|(i, &p)| (i, 10.0 * (p / wide_cnt as f32).log10())).collect();
             pks.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
             
-            if !auto_locked && start_time.elapsed().as_secs() >= 3 {
+            if !auto_locked && start_time.elapsed().as_secs() >= 4 {
                 if let Some(p) = pks.get(0) { current_if_hz = (p.0 as f64 / (fft_size as f64 / 2.0)) * (sample_rate / 2.0); auto_locked = true; }
             }
             
             print!("\x1B[2J\x1B[H"); 
-            println!("=== RX888 Final Locked Monitor ({:.3} - {:.3} MHz) ===", args.start_mhz, args.end_mhz);
+            println!("=== RX888 Final Monitor (GPIO Fixing) ===");
             print!("Waterfall: [");
             for i in 0..64 {
                 let mut max_db: f32 = -120.0;
@@ -155,9 +156,9 @@ fn main() {
             println!("]");
             
             let strongest_f = (pks[0].0 as f64 / (fft_size as f64 / 2.0)) * (sample_rate / 2.0);
-            println!("Status: {} | Tuner Lock: {:.3} MHz | Strongest Peak: {:.3} MHz ({:.1} dB)", 
-                if auto_locked { "LOCKED" } else { "TUNING" }, tuner_freq_hz as f64 / 1e6, strongest_f / 1e6, pks[0].1);
-            println!("{:-<110}", "");
+            println!("IF: {:.3} MHz | Status: {} | Peak: {:.3} MHz ({:.1} dB)", 
+                current_if_hz / 1e6, if auto_locked { "LOCKED" } else { "TUNING" }, strongest_f / 1e6, pks[0].1);
+            println!("{:-<105}", "");
             if auto_locked {
                 for (f_hz, (acc, cnt)) in channel_map.iter_mut() {
                     let db = if *cnt > 0 { 10.0 * (*acc / *cnt as f32).log10() } else { -120.0 };
