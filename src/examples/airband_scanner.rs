@@ -28,7 +28,7 @@ const FX3_BOOTLOADER_PID: u16 = 0x00f3;
 const FX3_FIRMWARE_PID_1: u16 = 0x00f1;
 const FX3_FIRMWARE_PID_2: u16 = 0x3ddc;
 
-#[derive(Parser)]
+#[derive(Parser, Clone)]
 struct Cli {
     #[arg(short, long)]
     firmware: PathBuf,
@@ -57,12 +57,15 @@ struct Cli {
     #[arg(short = 't', long, default_value_t = -95.0, allow_hyphen_values = true)]
     threshold: f32,
 
-    /// Initial IF offset Guess (MHz)
-    #[arg(short = 'i', long, default_value_t = 10.4)]
+    #[arg(short = 'i', long, default_value_t = 0.0)]
     if_mhz: f64,
 
     #[arg(short, long, default_value_t = false)]
     randomize: bool,
+    
+    /// Save 1 second of raw data to 'debug_dump.bin'
+    #[arg(long, default_value_t = false)]
+    dump: bool,
 }
 
 struct ChannelState {
@@ -82,7 +85,7 @@ fn power_to_dots(db: f32) -> String {
 
 fn main() {
     let args = Cli::parse();
-    let context = Context::new().expect("USB context failed");
+    let context = Context::new().unwrap();
     
     // Auto-Reset
     for pid in [FX3_FIRMWARE_PID_1, FX3_FIRMWARE_PID_2] {
@@ -92,7 +95,7 @@ fn main() {
         }
     }
 
-    let handle = open_device_with_timeout(&context, FX3_VID, FX3_BOOTLOADER_PID, Duration::from_secs(5)).expect("Bootloader not found");
+    let handle = open_device_with_timeout(&context, FX3_VID, FX3_BOOTLOADER_PID, Duration::from_secs(5)).unwrap();
     let mut fw_file = File::open(&args.firmware).unwrap();
     fx3::fx3_load_ram(handle, &mut fw_file).unwrap();
     thread::sleep(Duration::from_millis(1000));
@@ -109,6 +112,7 @@ fn main() {
         curr_mhz += 0.025; 
     }
 
+    // HW SETUP
     rx888_send_command(&handle, FX3Command::TUNERSTDBY, 0).ok();
     let mut gpio = GPIOPin::VHF_EN as u32 | GPIOPin::PGA_EN as u32;
     if args.randomize { gpio |= GPIOPin::RANDO as u32; }
@@ -124,7 +128,8 @@ fn main() {
 
     let handle = Arc::new(handle);
     let mut transfer_pool = TransferPool::new(handle.clone()).unwrap();
-    for _ in 0..32 { transfer_pool.submit_bulk(0x81, Vec::with_capacity(131072)).unwrap(); }
+    let packet_size = 16384; // SMALLER PACKETS LIKE ORIGINAL
+    for _ in 0..128 { transfer_pool.submit_bulk(0x81, Vec::with_capacity(packet_size)).unwrap(); }
 
     let fft_size = 4096;
     let mut planner = FftPlanner::new();
@@ -146,7 +151,12 @@ fn main() {
     let mut wide_accumulator = vec![0.0f32; fft_size / 2];
     let mut wide_count = 0;
     let start_time = Instant::now();
-    let mut auto_locked = false;
+    let mut auto_locked = (args.if_mhz != 0.0);
+    
+    let mut dump_file = if args.dump { Some(File::create("debug_dump.bin").unwrap()) } else { None };
+    let mut dump_count = 0;
+
+    let mut samples_buffer: Vec<i16> = Vec::with_capacity(65536);
 
     while running.load(Ordering::SeqCst) {
         let mut data = transfer_pool.poll(Duration::from_secs(1)).expect("USB Timeout");
@@ -154,19 +164,28 @@ fn main() {
             let d_u16: &mut [u16] = cast_slice_mut(&mut data);
             for x in d_u16 { *x ^= 0xFFFE * (*x & 0x1); }
         }
+        
+        if let Some(ref mut f) = dump_file {
+            if dump_count < args.sample_rate * 2 {
+                f.write_all(&data).ok();
+                dump_count += data.len() as u32;
+            } else {
+                println!("\n[INFO] Debug dump complete (debug_dump.bin)");
+                dump_file = None;
+            }
+        }
 
-        let samples: &[i16] = cast_slice(&data);
-
-        for chunk in samples.chunks_exact(fft_size) {
+        samples_buffer.extend_from_slice(cast_slice(&data));
+        
+        while samples_buffer.len() >= fft_size {
+            let chunk: Vec<i16> = samples_buffer.drain(0..fft_size).collect();
             let mut buf: Vec<Complex<f32>> = chunk.iter().enumerate()
                 .map(|(i, &s)| Complex::new((s as f32 / 32768.0) * window[i], 0.0))
                 .collect();
             fft.process(&mut buf);
 
             wide_count += 1;
-            for i in 0..(fft_size / 2) {
-                wide_accumulator[i] += buf[i].norm_sqr() / fft_norm_factor;
-            }
+            for i in 0..(fft_size / 2) { wide_accumulator[i] += buf[i].norm_sqr() / fft_norm_factor; }
 
             if auto_locked {
                 for (freq_hz, state) in channel_map.iter_mut() {
@@ -182,49 +201,39 @@ fn main() {
         }
 
         if last_ui_update.elapsed() >= Duration::from_millis(200) {
-            // Find Peak to Auto-Lock
             let mut peaks: Vec<(usize, f32)> = wide_accumulator.iter().enumerate()
-                .skip(30) // skip DC
+                .skip(40) // skip DC
                 .map(|(i, &p)| (i, 10.0 * (p / wide_count as f32).log10()))
                 .collect();
             peaks.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
             
-            if !auto_locked && start_time.elapsed().as_secs() >= 2 {
-                if let Some((idx, _db)) = peaks.get(0) {
+            if !auto_locked && start_time.elapsed().as_secs() >= 3 {
+                if let Some((idx, _)) = peaks.get(0) {
                     current_if_hz = (*idx as f64 / (fft_size as f64 / 2.0)) * (sample_rate / 2.0);
                     auto_locked = true;
                 }
             }
 
             print!("\x1B[2J\x1B[H"); 
-            println!("=== RX888 Auto-Locked Monitor ({:.3} - {:.3} MHz) ===", args.start_mhz, args.end_mhz);
-            
+            println!("=== RX888 Diagnostic Monitor (Range: {:.1} MHz) ===", (args.end_mhz - args.start_mhz));
             print!("Top Peaks: ");
             for (i, db) in peaks.iter().take(3) {
                 let f = (*i as f64 / (fft_size as f64 / 2.0)) * (sample_rate / 2.0);
                 print!("| {:.3} MHz ({:.1} dB) ", f / 1e6, db);
             }
             println!("|");
-            
-            println!("Status: {} | Current IF: {:.3} MHz", 
-                if auto_locked { "LOCKED" } else { "TUNING..." }, current_if_hz / 1e6);
+            println!("Status: {} | Detected IF: {:.3} MHz", if auto_locked { "LOCKED" } else { "TUNING..." }, current_if_hz / 1e6);
             println!("{:-<110}", "");
 
             if auto_locked {
-                let mut active_count = 0;
                 for (freq_hz, state) in channel_map.iter_mut() {
                     let db = if state.count > 0 { 10.0 * (state.accumulator / state.count as f32).log10() } else { -120.0 };
                     if db > args.threshold {
-                        active_count += 1;
                         println!("{:>8.3} MHz: {:<48} {:>6.1} dB", *freq_hz as f64 / 1e6, power_to_dots(db), db);
                     }
                     state.accumulator = 0.0; state.count = 0;
                 }
-                if active_count == 0 { println!("\n(Listening... All channels below threshold)"); }
-            } else {
-                println!("\nPLEASE WAIT: Finding the hardware IF carrier...");
             }
-            
             std::io::stdout().flush().unwrap();
             last_ui_update = Instant::now();
             if !auto_locked { wide_accumulator.fill(0.0); wide_count = 0; }
