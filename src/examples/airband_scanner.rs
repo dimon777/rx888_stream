@@ -22,7 +22,7 @@ use rx888::{
     GPIOPin,
 };
 
-#[derive(Parser)]
+#[derive(Parser, Clone)]
 struct Cli {
     #[arg(short, long)] firmware: PathBuf,
     #[arg(short = 's', long, default_value_t = 118.0)] start_mhz: f64,
@@ -48,7 +48,6 @@ fn main() {
     let args = Cli::parse();
     let context = Context::new().expect("USB failed");
     
-    // Auto-Reset
     for pid in [0x00f1, 0x3ddc] {
         if let Some(h) = context.open_device_with_vid_pid(0x04b4, pid) {
             let _ = rx888_send_command(&h, FX3Command::RESETFX3, 0);
@@ -58,7 +57,7 @@ fn main() {
 
     let b_handle = open_device_with_timeout(&context, 0x04b4, 0x00f3, Duration::from_secs(5)).expect("No bootloader");
     fx3::fx3_load_ram(b_handle, &mut File::open(&args.firmware).unwrap()).unwrap();
-    thread::sleep(Duration::from_millis(1000));
+    thread::sleep(Duration::from_millis(1500));
     let handle = open_device_with_timeout(&context, 0x04b4, 0x00f1, Duration::from_secs(5)).unwrap();
     handle.claim_interface(0).unwrap();
 
@@ -71,25 +70,28 @@ fn main() {
         curr_mhz += 0.025; 
     }
 
-    // --- SEQUENTIAL HARDWARE POWER-ON ---
-    rx888_send_command(&handle, FX3Command::TUNERSTDBY, 0).ok();
+    println!("[*] Synchronizing hardware...");
+    rx888_send_command(&handle, FX3Command::TUNERSTDBY, 0).expect("STDBY Fail");
     thread::sleep(Duration::from_millis(100));
-
-    rx888_send_command(&handle, FX3Command::TUNERINIT, 0).ok();
-    rx888_send_command_u64(&handle, FX3Command::TUNERTUNE, center_freq_hz).ok();
+    rx888_send_command(&handle, FX3Command::TUNERINIT, 0).expect("INIT Fail");
+    rx888_send_command_u64(&handle, FX3Command::TUNERTUNE, center_freq_hz).expect("TUNE Fail");
     
     rx888_send_argument(&handle, ArgumentList::R82XX_ATTENUATOR, args.vhf_lna).ok();
     rx888_send_argument(&handle, ArgumentList::R82XX_VGA, args.vhf_vga).ok();
+    rx888_send_argument(&handle, ArgumentList::R82XX_SIDEBAND, 0).ok(); 
+    rx888_send_argument(&handle, ArgumentList::R82XX_HARMONIC, 0).ok();
 
-    // POWER FIX: Set VHF_EN (Bit 15) AND SHDWN (Bit 5). Bit 5 must be 1 to power up the tuner!
-    let gpio = (GPIOPin::VHF_EN as u32) | (1 << 5) | (1 << 16); // Bits 15, 5, and 16 (PGA_EN)
-    rx888_send_command(&handle, FX3Command::GPIOFX3, gpio).ok();
+    // Reverted GPIO to MINIMAL VHF_EN ONLY (Removing Bit 5/16 which caused the halt)
+    let gpio = GPIOPin::VHF_EN as u32; 
+    rx888_send_command(&handle, FX3Command::GPIOFX3, gpio).expect("GPIO Fail");
 
-    rx888_send_argument(&handle, ArgumentList::DAT31_ATT, args.attenuation).ok();
-    rx888_send_argument(&handle, ArgumentList::AD8340_VGA, (args.gain as u16) | 0x80).ok();
+    rx888_send_argument(&handle, ArgumentList::DAT31_ATT, args.attenuation).expect("ATT Fail");
+    rx888_send_argument(&handle, ArgumentList::AD8340_VGA, (args.gain as u16) | 0x80).expect("VGA Fail");
 
-    rx888_send_command(&handle, FX3Command::STARTADC, args.sample_rate).ok();
-    rx888_send_command(&handle, FX3Command::STARTFX3, 0).ok();
+    rx888_send_command(&handle, FX3Command::STARTADC, args.sample_rate).expect("ADC_START Fail");
+    rx888_send_command(&handle, FX3Command::STARTFX3, 0).expect("FX3_START Fail");
+
+    println!("[*] Stream started. Waiting for data...");
 
     let handle_arc = Arc::new(handle);
     let mut transfer_pool = rusb_async::TransferPool::new(handle_arc.clone()).unwrap();
@@ -116,7 +118,7 @@ fn main() {
     let mut auto_locked = false;
 
     while running.load(Ordering::SeqCst) {
-        let mut data = transfer_pool.poll(Duration::from_secs(1)).expect("USB Timeout");
+        let mut data = transfer_pool.poll(Duration::from_secs(1)).expect("USB Timeout: Device stopped sending data");
         let samples: &[i16] = cast_slice(&data);
 
         for chunk in samples.chunks_exact(fft_size) {
@@ -144,18 +146,16 @@ fn main() {
             }
             
             print!("\x1B[2J\x1B[H");
-            println!("=== RX888 Final Monitor (GPIO-Fixed) ===");
-            print!("Waterfall: [");
+            println!("=== RX888 Rescued Monitor (Span: {:.1} MHz) ===", (args.end_mhz - args.start_mhz));
+            print!("0MHz [");
             for i in 0..64 {
-                let bin_start = i * (fft_size / 2) / 64;
-                let bin_end = (i + 1) * (fft_size / 2) / 64;
                 let mut max_db: f32 = -120.0;
-                for b in bin_start..bin_end { if b < wide_acc.len() { max_db = max_db.max(10.0 * (wide_acc[b] / (wide_cnt as f32)).log10()); } }
+                let bs = i * (fft_size/2) / 64; let be = (i+1) * (fft_size/2) / 64;
+                for b in bs..be { if b < wide_acc.len() { max_db = max_db.max(10.0 * (wide_acc[b] / (wide_cnt as f32)).log10()); } }
                 print!("{}", power_to_char(max_db));
             }
-            println!("]");
-            
-            println!("IF Offset: {:.3} MHz | Status: {} | Peak Power: {:.1} dB", current_if_hz / 1e6, if auto_locked { "LOCKED" } else { "TUNING" }, pks[0].1);
+            println!("] 16MHz");
+            println!("IF: {:.3} MHz | Status: {} | Peak: {:.1} dB", current_if_hz / 1e6, if auto_locked { "LOCKED" } else { "TUNING" }, pks[0].1);
             println!("{:-<100}", "");
             if auto_locked {
                 for (f_hz, s) in channel_map.iter_mut() {
