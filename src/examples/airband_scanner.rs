@@ -77,7 +77,8 @@ fn main() {
     }
 
     let context = Context::new().expect("Could not create USB context");
-    println!("[*] Initializing RX888 (Real-Sampling Mode)...");
+    
+    // Auto-Reset logic
     for pid in [FX3_FIRMWARE_PID_1, FX3_FIRMWARE_PID_2] {
         if let Some(handle) = context.open_device_with_vid_pid(FX3_VID, pid) {
             let _ = handle.write_control(0x40, 0x01, 0, 0, &0u32.to_le_bytes(), Duration::from_secs(1));
@@ -93,8 +94,10 @@ fn main() {
     let handle = open_device_with_timeout(&context, FX3_VID, FX3_FIRMWARE_PID_1, Duration::from_secs(5)).unwrap();
     handle.claim_interface(0).unwrap();
 
-    // Setup: Center the tuner exactly on the requested range
+    // Logic: Look 4.0 MHz "above" the center to find the real signals (Standard RX888 IF)
+    let if_offset_hz = 4_000_000.0;
     let center_freq_hz = ((args.start_mhz + args.end_mhz) / 2.0 * 1e6) as u64;
+    
     let mut channel_map: BTreeMap<u64, ChannelState> = BTreeMap::new();
     let mut curr_mhz = args.start_mhz;
     while curr_mhz <= args.end_mhz {
@@ -104,9 +107,11 @@ fn main() {
 
     rx888_send_command(&handle, FX3Command::TUNERINIT, 0).unwrap();
     rx888_send_command_u64(&handle, FX3Command::TUNERTUNE, center_freq_hz).unwrap();
+    
     let mut gpio = GPIOPin::VHF_EN as u32 | GPIOPin::PGA_EN as u32;
     if args.randomize { gpio |= GPIOPin::RANDO as u32; }
     rx888_send_command(&handle, FX3Command::GPIOFX3, gpio).unwrap();
+    
     rx888_send_argument(&handle, ArgumentList::R82XX_ATTENUATOR, 20).unwrap();
     rx888_send_argument(&handle, ArgumentList::R82XX_VGA, 12).unwrap();
     rx888_send_argument(&handle, ArgumentList::AD8340_VGA, (args.gain | 0x80) as u16).unwrap();
@@ -120,8 +125,6 @@ fn main() {
     let fft_size = 4096;
     let mut planner = FftPlanner::new();
     let fft = planner.plan_fft_forward(fft_size);
-    
-    // Precompute Hann Window
     let window: Vec<f32> = (0..fft_size)
         .map(|i| 0.5 * (1.0 - f32::cos(2.0 * std::f32::consts::PI * i as f32 / (fft_size - 1) as f32)))
         .collect();
@@ -132,7 +135,7 @@ fn main() {
 
     let mut last_ui_update = Instant::now();
     let sample_rate = args.sample_rate as f64;
-    let fft_norm_factor = (fft_size as f32).powi(2) * 0.375; // Corrected for Hann window gain
+    let fft_norm_factor = (fft_size as f32).powi(2) * 0.375;
 
     while running.load(Ordering::SeqCst) {
         let mut data = transfer_pool.poll(Duration::from_secs(1)).expect("USB Timeout");
@@ -141,23 +144,28 @@ fn main() {
             for x in d_u16 { *x ^= 0xFFFE * (*x & 0x1); }
         }
 
-        // Process as REAL samples
+        // Processing as IQ Interleaved
         let samples: &[i16] = cast_slice(&data);
 
-        for chunk in samples.chunks_exact(fft_size) {
-            let mut buf: Vec<Complex<f32>> = chunk.iter().enumerate()
-                .map(|(i, &s)| Complex::new((s as f32 / 32768.0) * window[i], 0.0))
+        for chunk in samples.chunks_exact(fft_size * 2) {
+            let mut buf: Vec<Complex<f32>> = chunk.chunks_exact(2).enumerate()
+                .map(|(i, iq)| Complex::new((iq[0] as f32 / 32768.0) * window[i], (iq[1] as f32 / 32768.0) * window[i]))
                 .collect();
             
             fft.process(&mut buf);
 
-            // In Real FFT, we only use 0..fft_size/2 (0 to SampleRate/2)
-            // But we treat the tuner as Zero-IF for now.
             for (freq_hz, state) in channel_map.iter_mut() {
-                let offset = (*freq_hz as f64 - center_freq_hz as f64).abs();
-                let bin_idx = (offset / (sample_rate / 2.0) * (fft_size as f64 / 2.0)) as usize;
+                // Map frequency to the IF-offset bin
+                let rel_offset = *freq_hz as f64 - center_freq_hz as f64;
+                let target_offset = rel_offset + if_offset_hz; // Shift by 4MHz
                 
-                if bin_idx < fft_size / 2 {
+                let bin_idx = if target_offset >= 0.0 {
+                    (target_offset / sample_rate * fft_size as f64) as usize
+                } else {
+                    ((target_offset + sample_rate) / sample_rate * fft_size as f64) as usize
+                };
+                
+                if bin_idx < fft_size {
                     state.accumulator += buf[bin_idx].norm_sqr() / fft_norm_factor;
                     state.count += 1;
                 }
@@ -166,8 +174,8 @@ fn main() {
 
         if last_ui_update.elapsed() >= Duration::from_millis(200) {
             print!("\x1B[2J\x1B[H"); 
-            println!("=== RX888 Windowed Monitor ({:.3} - {:.3} MHz) ===", args.start_mhz, args.end_mhz);
-            println!("Time: {} | Squelch: {:.1} dBFS", chrono::Local::now().format("%H:%M:%S"), args.threshold);
+            println!("=== RX888 IF-Shifted Monitor ({:.3} - {:.3} MHz) ===", args.start_mhz, args.end_mhz);
+            println!("Time: {} | Squelch: {:.1} dBFS | IF Offset: +4.0 MHz", chrono::Local::now().format("%H:%M:%S"), args.threshold);
             println!("{:-<110}", "");
 
             let mut active_count = 0;
@@ -179,12 +187,13 @@ fn main() {
                 }
                 state.accumulator = 0.0; state.count = 0;
             }
-            if active_count == 0 { println!("\n(Scanning... Noise Floor is around -100 dBFS)"); }
+            if active_count == 0 { println!("\n(Scanning at 4MHz IF... No signals above threshold)"); }
             std::io::stdout().flush().unwrap();
             last_ui_update = Instant::now();
         }
         transfer_pool.submit_bulk(0x81, data).unwrap();
     }
+    
     rx888_send_command(handle.as_ref(), FX3Command::STOPFX3, 0).ok();
 }
 
