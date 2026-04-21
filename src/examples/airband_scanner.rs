@@ -36,19 +36,31 @@ struct Cli {
     #[arg(short = 's', long, default_value_t = 118.0)]
     start_mhz: f64,
 
-    #[arg(short = 'e', long, default_value_t = 128.0)]
+    #[arg(short = 'e', long, default_value_t = 120.0)]
     end_mhz: f64,
 
     #[arg(short, long, default_value_t = 32000000)]
     sample_rate: u32,
 
-    #[arg(short, long, default_value_t = 60)]
+    /// Final PGA Gain (0-127). Working default: 30
+    #[arg(short, long, default_value_t = 30)]
     gain: u8,
+
+    /// Tuner LNA gain (0-20). Working default: 10
+    #[arg(long, default_value_t = 10)]
+    vhf_lna: u16,
+
+    /// Tuner VGA gain (0-12). Working default: 5
+    #[arg(long, default_value_t = 5)]
+    vhf_vga: u16,
+
+    /// Hardware attenuation (0-20). Working default: 20
+    #[arg(short, long, default_value_t = 20)]
+    attenuation: u16,
 
     #[arg(short = 't', long, default_value_t = -95.0, allow_hyphen_values = true)]
     threshold: f32,
 
-    /// IF offset in MHz (Standard for R828D is around 5.0)
     #[arg(short = 'i', long, default_value_t = 5.0)]
     if_mhz: f64,
 
@@ -62,8 +74,8 @@ struct ChannelState {
 }
 
 fn power_to_dots(db: f32) -> String {
-    let min_db = -110.0;
-    let max_db = -30.0;
+    let min_db = -115.0;
+    let max_db = -20.0;
     let width = 45;
     if db < min_db { return "...".to_string(); }
     let normalized = ((db - min_db) / (max_db - min_db)).clamp(0.0, 1.0);
@@ -74,18 +86,16 @@ fn power_to_dots(db: f32) -> String {
 fn main() {
     let args = Cli::parse();
     
-    let span = args.end_mhz - args.start_mhz;
-    if span <= 0.0 || span > 10.0 {
-        eprintln!("Error: Range must be < 10MHz");
+    if args.end_mhz - args.start_mhz > 10.0 {
+        eprintln!("Error: Range limited to 10MHz");
         std::process::exit(1);
     }
 
-    let context = Context::new().expect("USB Context failed");
+    let context = Context::new().expect("USB context failed");
     
     // Auto-Reset
     for pid in [FX3_FIRMWARE_PID_1, FX3_FIRMWARE_PID_2] {
         if let Some(handle) = context.open_device_with_vid_pid(FX3_VID, pid) {
-            let _ = handle.write_control(0x40, 0x01, 0, 0, &0u32.to_le_bytes(), Duration::from_secs(1));
             let _ = rx888_send_command(&handle, FX3Command::RESETFX3, 0);
             thread::sleep(Duration::from_millis(1500));
         }
@@ -95,11 +105,10 @@ fn main() {
     let mut fw_file = File::open(&args.firmware).unwrap();
     fx3::fx3_load_ram(handle, &mut fw_file).unwrap();
     thread::sleep(Duration::from_millis(1000));
-    let handle = open_device_with_timeout(&context, FX3_VID, FX3_FIRMWARE_PID_1, Duration::from_secs(5)).expect("Firmware device not found");
+    let handle = open_device_with_timeout(&context, FX3_VID, FX3_FIRMWARE_PID_1, Duration::from_secs(5)).unwrap();
     handle.claim_interface(0).unwrap();
 
-    // Logic: Signal is centered at IF_MHZ (default 5.0) in the 16MHz baseband
-    let if_offsets_hz = args.if_mhz * 1e6;
+    let if_offset_hz = args.if_mhz * 1e6;
     let center_freq_hz = ((args.start_mhz + args.end_mhz) / 2.0 * 1e6) as u64;
     
     let mut channel_map: BTreeMap<u64, ChannelState> = BTreeMap::new();
@@ -109,14 +118,24 @@ fn main() {
         curr_mhz += 0.025; 
     }
 
-    rx888_send_command(&handle, FX3Command::TUNERINIT, 0).unwrap();
-    rx888_send_command_u64(&handle, FX3Command::TUNERTUNE, center_freq_hz).unwrap();
+    // MATCHING WORKING INIT SEQUENCE
+    rx888_send_command(&handle, FX3Command::TUNERSTDBY, 0).ok();
+    
     let mut gpio = GPIOPin::VHF_EN as u32 | GPIOPin::PGA_EN as u32;
     if args.randomize { gpio |= GPIOPin::RANDO as u32; }
     rx888_send_command(&handle, FX3Command::GPIOFX3, gpio).unwrap();
-    rx888_send_argument(&handle, ArgumentList::R82XX_ATTENUATOR, 20).unwrap();
-    rx888_send_argument(&handle, ArgumentList::R82XX_VGA, 12).unwrap();
-    rx888_send_argument(&handle, ArgumentList::AD8340_VGA, (args.gain | 0x80) as u16).unwrap();
+
+    rx888_send_command(&handle, FX3Command::TUNERINIT, 0).unwrap();
+    rx888_send_command_u64(&handle, FX3Command::TUNERTUNE, center_freq_hz).unwrap();
+    
+    // TUNER GAINS
+    rx888_send_argument(&handle, ArgumentList::R82XX_ATTENUATOR, args.vhf_lna).unwrap();
+    rx888_send_argument(&handle, ArgumentList::R82XX_VGA, args.vhf_vga).unwrap();
+    
+    // SYSTEM ATTENUATION & PGA GAIN
+    rx888_send_argument(&handle, ArgumentList::DAT31_ATT, args.attenuation).unwrap();
+    rx888_send_argument(&handle, ArgumentList::AD8340_VGA, (args.gain as u16) | 0x80).unwrap();
+
     rx888_send_command(&handle, FX3Command::STARTADC, args.sample_rate).unwrap();
     rx888_send_command(&handle, FX3Command::STARTFX3, 0).unwrap();
 
@@ -128,12 +147,8 @@ fn main() {
     let mut planner = FftPlanner::new();
     let fft = planner.plan_fft_forward(fft_size);
     
-    // Blackman-Harris Window (Superior for suppressing DC leakage)
     let window: Vec<f32> = (0..fft_size).map(|i| {
-        let a0 = 0.35875;
-        let a1 = 0.48829;
-        let a2 = 0.14128;
-        let a3 = 0.01168;
+        let a0 = 0.35875; let a1 = 0.48829; let a2 = 0.14128; let a3 = 0.01168;
         let t = (2.0 * std::f32::consts::PI * i as f32) / (fft_size - 1) as f32;
         a0 - a1 * t.cos() + a2 * (2.0 * t).cos() - a3 * (3.0 * t).cos()
     }).collect();
@@ -144,7 +159,7 @@ fn main() {
 
     let mut last_ui_update = Instant::now();
     let sample_rate = args.sample_rate as f64;
-    let fft_norm_factor = (fft_size as f32).powi(2) * 0.2; // Adjusted for BH window gain
+    let fft_norm_factor = (fft_size as f32).powi(2) * 0.15; // Corrected normalizer
 
     while running.load(Ordering::SeqCst) {
         let mut data = transfer_pool.poll(Duration::from_secs(1)).expect("USB Timeout");
@@ -153,7 +168,6 @@ fn main() {
             for x in d_u16 { *x ^= 0xFFFE * (*x & 0x1); }
         }
 
-        // CORRECT: Treat every 16-bit word as one REAL sample
         let samples: &[i16] = cast_slice(&data);
 
         for chunk in samples.chunks_exact(fft_size) {
@@ -164,11 +178,8 @@ fn main() {
             fft.process(&mut buf);
 
             for (freq_hz, state) in channel_map.iter_mut() {
-                // Map the relative frequency offset to the 5.0MHz IF region
                 let rel_offset = *freq_hz as f64 - center_freq_hz as f64;
-                let target_freq_in_baseband = (if_offsets_hz + rel_offset).abs();
-                
-                // bin_idx = (Frequency / Nyquist) * (FFT_Size / 2)
+                let target_freq_in_baseband = (if_offset_hz + rel_offset).abs();
                 let bin_idx = (target_freq_in_baseband / (sample_rate / 2.0) * (fft_size as f64 / 2.0)) as usize;
                 
                 if bin_idx < fft_size / 2 {
@@ -180,8 +191,9 @@ fn main() {
 
         if last_ui_update.elapsed() >= Duration::from_millis(200) {
             print!("\x1B[2J\x1B[H"); 
-            println!("=== RX888 Real-Sample Monitor ({:.3} - {:.3} MHz) ===", args.start_mhz, args.end_mhz);
-            println!("Time: {} | Squelch: {:.1} dBFS | IF Offset: {} MHz", chrono::Local::now().format("%H:%M:%S"), args.threshold, args.if_mhz);
+            println!("=== RX888 Hardware-Matched Monitor ({:.3} - {:.3} MHz) ===", args.start_mhz, args.end_mhz);
+            println!("Time: {} | Squelch: {:.1} dBFS | IF: {} MHz", chrono::Local::now().format("%H:%M:%S"), args.threshold, args.if_mhz);
+            println!("Gains: LNA {} | VGA {} | PGA {} | Atten {}", args.vhf_lna, args.vhf_vga, args.gain, args.attenuation);
             println!("{:-<110}", "");
 
             let mut active_count = 0;
@@ -193,7 +205,7 @@ fn main() {
                 }
                 state.accumulator = 0.0; state.count = 0;
             }
-            if active_count == 0 { println!("\n(Scanning at {} MHz IF... Noise floor should be below -100 dBFS)", args.if_mhz); }
+            if active_count == 0 { println!("\n(Scanning... Noise floor should be MUCH lower now)"); }
             std::io::stdout().flush().unwrap();
             last_ui_update = Instant::now();
         }
