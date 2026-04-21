@@ -31,16 +31,16 @@ struct Cli {
     #[arg(short, long, default_value_t = 30)] gain: u8,
     #[arg(long, default_value_t = 29)] vhf_lna: u16,
     #[arg(long, default_value_t = 10)] vhf_vga: u16,
-    #[arg(short, long, default_value_t = 0)] attenuation: u16, // Use 0 for max sensitivity
+    #[arg(short, long, default_value_t = 0)] attenuation: u16,
     #[arg(short = 't', long, default_value_t = -90.0, allow_hyphen_values = true)] threshold: f32,
-    #[arg(short = 'i', long, default_value_t = 10.203)] if_mhz: f64, // Default to your last lock
+    #[arg(short = 'i', long, default_value_t = 10.2)] if_mhz: f64,
     #[arg(short, long, default_value_t = false)] randomize: bool,
 }
 
 fn power_to_char(db: f32) -> char {
-    if db > -15.0 { '#' }
-    else if db > -30.0 { '=' }
-    else if db > -50.0 { '-' }
+    if db > -20.0 { '#' }
+    else if db > -35.0 { '=' }
+    else if db > -55.0 { '-' }
     else if db > -75.0 { '.' }
     else { ' ' }
 }
@@ -58,7 +58,7 @@ fn main() {
 
     let b_handle = open_device_with_timeout(&context, 0x04b4, 0x00f3, Duration::from_secs(5)).expect("No bootloader");
     fx3::fx3_load_ram(b_handle, &mut File::open(&args.firmware).unwrap()).unwrap();
-    thread::sleep(Duration::from_millis(1000));
+    thread::sleep(Duration::from_millis(1500));
     let handle = open_device_with_timeout(&context, 0x04b4, 0x00f1, Duration::from_secs(5)).unwrap();
     handle.claim_interface(0).unwrap();
 
@@ -70,13 +70,16 @@ fn main() {
         curr_mhz += 0.025; 
     }
 
-    println!("[*] Tuning to {:.3} MHz Center...", tuner_center_hz as f64 / 1e6);
+    println!("[*] Syncing Tuner (Stable Mode)...");
     rx888_send_command(&handle, FX3Command::TUNERSTDBY, 0).ok();
-    thread::sleep(Duration::from_millis(100));
+    thread::sleep(Duration::from_millis(200));
     rx888_send_command(&handle, FX3Command::TUNERINIT, 0).ok();
+    thread::sleep(Duration::from_millis(200));
     rx888_send_command_u64(&handle, FX3Command::TUNERTUNE, tuner_center_hz).ok();
+    thread::sleep(Duration::from_millis(200));
     
-    let mut gpio = GPIOPin::VHF_EN as u32 | (1 << 5); // VHF_EN + SHDWN
+    // SAFE GPIO: VHF_EN ONLY. Bit 5 and Bit 16 are confirmed to cause timeouts on MkII.
+    let mut gpio = GPIOPin::VHF_EN as u32;
     if args.randomize { gpio |= GPIOPin::RANDO as u32; }
     rx888_send_command(&handle, FX3Command::GPIOFX3, gpio).ok();
 
@@ -87,6 +90,8 @@ fn main() {
 
     rx888_send_command(&handle, FX3Command::STARTADC, args.sample_rate).ok();
     rx888_send_command(&handle, FX3Command::STARTFX3, 0).ok();
+
+    println!("[*] Lock complete. Streaming...");
 
     let handle_arc = Arc::new(handle);
     let mut transfer_pool = rusb_async::TransferPool::new(handle_arc.clone()).unwrap();
@@ -113,7 +118,7 @@ fn main() {
     let mut auto_locked = false;
 
     while running.load(Ordering::SeqCst) {
-        let mut data = transfer_pool.poll(Duration::from_secs(1)).expect("USB Timeout");
+        let mut data = transfer_pool.poll(Duration::from_secs(1)).expect("USB Timeout: Tuner is not sending data");
         if args.randomize {
             let d_u16: &mut [u16] = cast_slice_mut(&mut data);
             for x in d_u16 { *x ^= 0xFFFE * (*x & 0x1); }
@@ -140,14 +145,14 @@ fn main() {
                 .map(|(i, &p)| (i, 10.0 * (p / wide_cnt as f32).log10())).collect();
             pks.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
             
-            if !auto_locked && start_time.elapsed().as_secs() >= 3 {
+            if !auto_locked && start_time.elapsed().as_secs() >= 4 {
                 if let Some(p) = pks.get(0) { current_if_hz = (p.0 as f64 / (fft_size as f64 / 2.0)) * (sample_rate / 2.0); auto_locked = true; }
             }
             
             let strongest_f_hz = (pks[0].0 as f64 / (fft_size as f64 / 2.0)) * (sample_rate / 2.0);
             
             print!("\x1B[2J\x1B[H"); 
-            println!("=== RX888 Peak-Tracking Monitor ({:.1} MHz span) ===", args.end_mhz - args.start_mhz);
+            println!("=== RX888 Tracking Monitor (Clean Mode) ===");
             print!("Waterfall: [");
             for i in 0..64 {
                 let mut max_db: f32 = -120.0;
@@ -157,18 +162,17 @@ fn main() {
             }
             println!("]");
             
-            println!("Status: {} | IF Lock: {:.3} MHz | Strongest Signal: {:.3} MHz ({:.1} dB)", 
-                if auto_locked { "LOCKED" } else { "TUNING" }, current_if_hz / 1e6, strongest_f_hz / 1e6, pks[0].1);
+            println!("IF Lock: {:.3} MHz | Status: {} | Peak: {:.3} MHz ({:.1} dB)", 
+                current_if_hz / 1e6, if auto_locked { "LOCKED" } else { "TUNING" }, strongest_f_hz / 1e6, pks[0].1);
             
             print!("Top Hits:  ");
             for p in pks.iter().take(5) {
                 let f_hz = (p.0 as f64 / (fft_size as f64 / 2.0)) * (sample_rate / 2.0);
-                // Translate back to radio frequency: Radio = TunerCenter + (F_Baseband - IF)
                 let radio_f = (tuner_center_hz as f64 + (f_hz - current_if_hz)) / 1e6;
                 print!("| {:.3}MHz ({:.1}dB) ", radio_f, p.1);
             }
             println!("|");
-            println!("{:-<115}", "");
+            println!("{:-<110}", "");
 
             if auto_locked {
                 for (f_hz, (acc, cnt)) in channel_map.iter_mut() {
