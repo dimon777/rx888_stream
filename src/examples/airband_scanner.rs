@@ -89,7 +89,7 @@ const MAX_SCAN_BW_HZ: u64 = 10_000_000;
 
 /// USB sample rate chosen to cover the full 10 MHz VHF slice.
 /// The RX888 accepts 2 / 4 / 8 / 10 / 16 / 32 MSPS in VHF mode.
-const SAMPLE_RATE: u64 = 10_000_000; // 10 MSPS → 10 MHz bandwidth
+const SAMPLE_RATE: u64 = 32_000_000; // 32 MSPS
 
 /// FFT size.
 /// At 10 MSPS: bin width = 10 000 000 / 4096 ≈ 2 441 Hz — well under 25 kHz.
@@ -284,36 +284,31 @@ fn build_hann_window(n: usize) -> Vec<f32> {
 /// Returns `fft_size` bins in **FFT-shifted** order (bin 0 = –SR/2, centre =
 /// DC), normalised to dBFS (0 dBFS = full-scale sine wave).
 fn compute_power_spectrum(samples: &[i16], fft_size: usize, window: &[f32]) -> Vec<f32> {
-    // 1. Build windowed complex input buffer
+    // 1. Build windowed complex input buffer from REAL samples
     let scale = 1.0_f32 / 32768.0;
     let mut buf: Vec<Complex<f32>> = samples
-        .chunks_exact(2)
+        .iter()
         .take(fft_size)
         .enumerate()
-        .map(|(i, iq)| Complex {
-            re: iq[0] as f32 * scale * window[i],
-            im: iq[1] as f32 * scale * window[i],
+        .map(|(i, &s)| Complex {
+            re: s as f32 * scale * window[i],
+            im: 0.0,
         })
         .collect();
 
-    // Zero-pad if buffer was shorter than expected (safety net)
     buf.resize(fft_size, Complex::new(0.0, 0.0));
 
-    // 2. Forward FFT in-place
+    // 2. Forward FFT
     let mut planner: FftPlanner<f32> = FftPlanner::new();
     let fft = planner.plan_fft_forward(fft_size);
     fft.process(&mut buf);
 
-    // 3. Compute power and apply FFT-shift so DC is at the centre of the array.
-    //    Normalisation: divide by fft_size so the result is independent of window size.
+    // 3. Compute power (positive frequencies only, 0 to SR/2)
     let norm_sq = (1.0_f32 / fft_size as f32).powi(2);
-    let half = fft_size / 2;
-    let mut power = vec![0.0_f32; fft_size];
-    for i in 0..fft_size {
-        let shifted = (i + half) % fft_size;
+    let mut power = vec![0.0_f32; fft_size / 2];
+    for i in 0..(fft_size / 2) {
         let mag_sq = (buf[i].re * buf[i].re + buf[i].im * buf[i].im) * norm_sq;
-        // Guard against log(0) — clamp to a very small number
-        power[shifted] = 10.0 * mag_sq.max(1e-20_f32).log10();
+        power[i] = 10.0 * mag_sq.max(1e-20_f32).log10();
     }
     power
 }
@@ -333,13 +328,15 @@ fn average_spectra(spectra: &[Vec<f32>]) -> Vec<f32> {
     acc
 }
 
-/// Return the bin index (in FFT-shifted, 0 = –SR/2 layout) for a given
-/// channel offset relative to the tuned centre frequency.
+/// Return the bin index for a given channel frequency.
 fn channel_bin(ch_hz: u64, center_hz: u64, sample_rate: u64, fft_size: usize) -> usize {
-    let offset = ch_hz as f64 - center_hz as f64;       // signed Hz offset
-    let hz_per_bin = sample_rate as f64 / fft_size as f64;
-    let bin = (offset / hz_per_bin + fft_size as f64 / 2.0).round() as isize;
-    bin.clamp(0, fft_size as isize - 1) as usize
+    const IF_HZ: f64 = 10_200_000.0;
+    let offset_from_center = ch_hz as f64 - center_hz as f64;
+    let target_adc_hz = IF_HZ + offset_from_center;
+    
+    // For real sampling at SR, signal at target appears at bin:
+    let bin = (target_adc_hz / (sample_rate as f64) * (fft_size as f64)).round() as isize;
+    bin.clamp(0, (fft_size / 2 - 1) as isize) as usize
 }
 
 /// Average power across a small neighbourhood of bins (±half_width) around
@@ -509,7 +506,7 @@ fn scanner_loop(
     io::stdout().flush().ok();
 
     // ── Number of i16 values consumed per display refresh ───────────────────
-    let samples_needed = FFT_SIZE * 2 * FFT_AVERAGES;
+    let samples_needed = FFT_SIZE * FFT_AVERAGES;
 
     let mut spectra: Vec<Vec<f32>> = Vec::with_capacity(FFT_AVERAGES);
     let mut power_buf: Vec<f32> = vec![DISPLAY_FLOOR_DB; n_ch];
@@ -524,13 +521,13 @@ fn scanner_loop(
             {
                 let guard = ring.lock().unwrap();
                 if guard.len() >= samples_needed {
-                    break guard.iter().copied().collect::<Vec<i16>>();
+                    break guard.iter().take(samples_needed).copied().collect::<Vec<i16>>();
                 }
             }
             std::thread::sleep(Duration::from_millis(5));
         };
 
-        // Consume exactly `samples_needed` from the front of the ring
+        // Consume checks
         {
             let mut guard = ring.lock().unwrap();
             for _ in 0..samples_needed {
@@ -541,8 +538,8 @@ fn scanner_loop(
         // Compute FFT_AVERAGES power spectra and average them
         spectra.clear();
         for frame in 0..FFT_AVERAGES {
-            let start = frame * FFT_SIZE * 2;
-            let end = start + FFT_SIZE * 2;
+            let start = frame * FFT_SIZE;
+            let end = start + FFT_SIZE;
             spectra.push(compute_power_spectrum(&block[start..end], FFT_SIZE, &window));
         }
         let avg = average_spectra(&spectra);
