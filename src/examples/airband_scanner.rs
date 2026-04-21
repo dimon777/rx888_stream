@@ -36,7 +36,7 @@ struct Cli {
     #[arg(short = 's', long, default_value_t = 118.0)]
     start_mhz: f64,
 
-    #[arg(short = 'e', long, default_value_t = 120.0)]
+    #[arg(short = 'e', long, default_value_t = 128.0)]
     end_mhz: f64,
 
     #[arg(short, long, default_value_t = 32000000)]
@@ -45,8 +45,12 @@ struct Cli {
     #[arg(short, long, default_value_t = 60)]
     gain: u8,
 
-    #[arg(short = 't', long, default_value_t = -90.0, allow_hyphen_values = true)]
+    #[arg(short = 't', long, default_value_t = -95.0, allow_hyphen_values = true)]
     threshold: f32,
+
+    /// IF offset in MHz (Standard for R828D is around 5.0)
+    #[arg(short = 'i', long, default_value_t = 5.0)]
+    if_mhz: f64,
 
     #[arg(short, long, default_value_t = false)]
     randomize: bool,
@@ -72,13 +76,13 @@ fn main() {
     
     let span = args.end_mhz - args.start_mhz;
     if span <= 0.0 || span > 10.0 {
-        eprintln!("Error: Scan range must be 0-10 MHz (Requested: {:.1} MHz)", span);
+        eprintln!("Error: Range must be < 10MHz");
         std::process::exit(1);
     }
 
-    let context = Context::new().expect("Could not create USB context");
+    let context = Context::new().expect("USB Context failed");
     
-    // Auto-Reset logic
+    // Auto-Reset
     for pid in [FX3_FIRMWARE_PID_1, FX3_FIRMWARE_PID_2] {
         if let Some(handle) = context.open_device_with_vid_pid(FX3_VID, pid) {
             let _ = handle.write_control(0x40, 0x01, 0, 0, &0u32.to_le_bytes(), Duration::from_secs(1));
@@ -87,15 +91,15 @@ fn main() {
         }
     }
 
-    let handle = open_device_with_timeout(&context, FX3_VID, FX3_BOOTLOADER_PID, Duration::from_secs(5)).unwrap();
+    let handle = open_device_with_timeout(&context, FX3_VID, FX3_BOOTLOADER_PID, Duration::from_secs(5)).expect("Bootloader not found");
     let mut fw_file = File::open(&args.firmware).unwrap();
     fx3::fx3_load_ram(handle, &mut fw_file).unwrap();
     thread::sleep(Duration::from_millis(1000));
-    let handle = open_device_with_timeout(&context, FX3_VID, FX3_FIRMWARE_PID_1, Duration::from_secs(5)).unwrap();
+    let handle = open_device_with_timeout(&context, FX3_VID, FX3_FIRMWARE_PID_1, Duration::from_secs(5)).expect("Firmware device not found");
     handle.claim_interface(0).unwrap();
 
-    // Logic: Look 4.0 MHz "above" the center to find the real signals (Standard RX888 IF)
-    let if_offset_hz = 4_000_000.0;
+    // Logic: Signal is centered at IF_MHZ (default 5.0) in the 16MHz baseband
+    let if_offsets_hz = args.if_mhz * 1e6;
     let center_freq_hz = ((args.start_mhz + args.end_mhz) / 2.0 * 1e6) as u64;
     
     let mut channel_map: BTreeMap<u64, ChannelState> = BTreeMap::new();
@@ -107,11 +111,9 @@ fn main() {
 
     rx888_send_command(&handle, FX3Command::TUNERINIT, 0).unwrap();
     rx888_send_command_u64(&handle, FX3Command::TUNERTUNE, center_freq_hz).unwrap();
-    
     let mut gpio = GPIOPin::VHF_EN as u32 | GPIOPin::PGA_EN as u32;
     if args.randomize { gpio |= GPIOPin::RANDO as u32; }
     rx888_send_command(&handle, FX3Command::GPIOFX3, gpio).unwrap();
-    
     rx888_send_argument(&handle, ArgumentList::R82XX_ATTENUATOR, 20).unwrap();
     rx888_send_argument(&handle, ArgumentList::R82XX_VGA, 12).unwrap();
     rx888_send_argument(&handle, ArgumentList::AD8340_VGA, (args.gain | 0x80) as u16).unwrap();
@@ -125,9 +127,16 @@ fn main() {
     let fft_size = 4096;
     let mut planner = FftPlanner::new();
     let fft = planner.plan_fft_forward(fft_size);
-    let window: Vec<f32> = (0..fft_size)
-        .map(|i| 0.5 * (1.0 - f32::cos(2.0 * std::f32::consts::PI * i as f32 / (fft_size - 1) as f32)))
-        .collect();
+    
+    // Blackman-Harris Window (Superior for suppressing DC leakage)
+    let window: Vec<f32> = (0..fft_size).map(|i| {
+        let a0 = 0.35875;
+        let a1 = 0.48829;
+        let a2 = 0.14128;
+        let a3 = 0.01168;
+        let t = (2.0 * std::f32::consts::PI * i as f32) / (fft_size - 1) as f32;
+        a0 - a1 * t.cos() + a2 * (2.0 * t).cos() - a3 * (3.0 * t).cos()
+    }).collect();
 
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
@@ -135,7 +144,7 @@ fn main() {
 
     let mut last_ui_update = Instant::now();
     let sample_rate = args.sample_rate as f64;
-    let fft_norm_factor = (fft_size as f32).powi(2) * 0.375;
+    let fft_norm_factor = (fft_size as f32).powi(2) * 0.2; // Adjusted for BH window gain
 
     while running.load(Ordering::SeqCst) {
         let mut data = transfer_pool.poll(Duration::from_secs(1)).expect("USB Timeout");
@@ -144,28 +153,25 @@ fn main() {
             for x in d_u16 { *x ^= 0xFFFE * (*x & 0x1); }
         }
 
-        // Processing as IQ Interleaved
+        // CORRECT: Treat every 16-bit word as one REAL sample
         let samples: &[i16] = cast_slice(&data);
 
-        for chunk in samples.chunks_exact(fft_size * 2) {
-            let mut buf: Vec<Complex<f32>> = chunk.chunks_exact(2).enumerate()
-                .map(|(i, iq)| Complex::new((iq[0] as f32 / 32768.0) * window[i], (iq[1] as f32 / 32768.0) * window[i]))
+        for chunk in samples.chunks_exact(fft_size) {
+            let mut buf: Vec<Complex<f32>> = chunk.iter().enumerate()
+                .map(|(i, &s)| Complex::new((s as f32 / 32768.0) * window[i], 0.0))
                 .collect();
             
             fft.process(&mut buf);
 
             for (freq_hz, state) in channel_map.iter_mut() {
-                // Map frequency to the IF-offset bin
+                // Map the relative frequency offset to the 5.0MHz IF region
                 let rel_offset = *freq_hz as f64 - center_freq_hz as f64;
-                let target_offset = rel_offset + if_offset_hz; // Shift by 4MHz
+                let target_freq_in_baseband = (if_offsets_hz + rel_offset).abs();
                 
-                let bin_idx = if target_offset >= 0.0 {
-                    (target_offset / sample_rate * fft_size as f64) as usize
-                } else {
-                    ((target_offset + sample_rate) / sample_rate * fft_size as f64) as usize
-                };
+                // bin_idx = (Frequency / Nyquist) * (FFT_Size / 2)
+                let bin_idx = (target_freq_in_baseband / (sample_rate / 2.0) * (fft_size as f64 / 2.0)) as usize;
                 
-                if bin_idx < fft_size {
+                if bin_idx < fft_size / 2 {
                     state.accumulator += buf[bin_idx].norm_sqr() / fft_norm_factor;
                     state.count += 1;
                 }
@@ -174,26 +180,25 @@ fn main() {
 
         if last_ui_update.elapsed() >= Duration::from_millis(200) {
             print!("\x1B[2J\x1B[H"); 
-            println!("=== RX888 IF-Shifted Monitor ({:.3} - {:.3} MHz) ===", args.start_mhz, args.end_mhz);
-            println!("Time: {} | Squelch: {:.1} dBFS | IF Offset: +4.0 MHz", chrono::Local::now().format("%H:%M:%S"), args.threshold);
+            println!("=== RX888 Real-Sample Monitor ({:.3} - {:.3} MHz) ===", args.start_mhz, args.end_mhz);
+            println!("Time: {} | Squelch: {:.1} dBFS | IF Offset: {} MHz", chrono::Local::now().format("%H:%M:%S"), args.threshold, args.if_mhz);
             println!("{:-<110}", "");
 
             let mut active_count = 0;
             for (freq_hz, state) in channel_map.iter_mut() {
-                let db = if state.count > 0 { 10.0 * (state.accumulator / state.count as f32).log10() } else { -110.0 };
+                let db = if state.count > 0 { 10.0 * (state.accumulator / state.count as f32).log10() } else { -120.0 };
                 if db > args.threshold {
                     active_count += 1;
                     println!("{:>8.3} MHz: {:<48} {:>6.1} dB", *freq_hz as f64 / 1e6, power_to_dots(db), db);
                 }
                 state.accumulator = 0.0; state.count = 0;
             }
-            if active_count == 0 { println!("\n(Scanning at 4MHz IF... No signals above threshold)"); }
+            if active_count == 0 { println!("\n(Scanning at {} MHz IF... Noise floor should be below -100 dBFS)", args.if_mhz); }
             std::io::stdout().flush().unwrap();
             last_ui_update = Instant::now();
         }
         transfer_pool.submit_bulk(0x81, data).unwrap();
     }
-    
     rx888_send_command(handle.as_ref(), FX3Command::STOPFX3, 0).ok();
 }
 
