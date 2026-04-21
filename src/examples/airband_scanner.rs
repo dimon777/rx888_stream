@@ -57,7 +57,8 @@ struct Cli {
     #[arg(short = 't', long, default_value_t = -95.0, allow_hyphen_values = true)]
     threshold: f32,
 
-    #[arg(short = 'i', long, default_value_t = 5.0)]
+    /// Initial IF offset Guess (MHz)
+    #[arg(short = 'i', long, default_value_t = 10.4)]
     if_mhz: f64,
 
     #[arg(short, long, default_value_t = false)]
@@ -71,7 +72,7 @@ struct ChannelState {
 
 fn power_to_dots(db: f32) -> String {
     let min_db = -115.0;
-    let max_db = -20.0;
+    let max_db = -15.0;
     let width = 45;
     if db < min_db { return "...".to_string(); }
     let normalized = ((db - min_db) / (max_db - min_db)).clamp(0.0, 1.0);
@@ -98,8 +99,8 @@ fn main() {
     let handle = open_device_with_timeout(&context, FX3_VID, FX3_FIRMWARE_PID_1, Duration::from_secs(5)).unwrap();
     handle.claim_interface(0).unwrap();
 
-    let if_offset_hz = args.if_mhz * 1e6;
     let center_freq_hz = ((args.start_mhz + args.end_mhz) / 2.0 * 1e6) as u64;
+    let mut current_if_hz = args.if_mhz * 1e6;
     
     let mut channel_map: BTreeMap<u64, ChannelState> = BTreeMap::new();
     let mut curr_mhz = args.start_mhz;
@@ -109,19 +110,15 @@ fn main() {
     }
 
     rx888_send_command(&handle, FX3Command::TUNERSTDBY, 0).ok();
-    
     let mut gpio = GPIOPin::VHF_EN as u32 | GPIOPin::PGA_EN as u32;
     if args.randomize { gpio |= GPIOPin::RANDO as u32; }
     rx888_send_command(&handle, FX3Command::GPIOFX3, gpio).unwrap();
-
     rx888_send_command(&handle, FX3Command::TUNERINIT, 0).unwrap();
     rx888_send_command_u64(&handle, FX3Command::TUNERTUNE, center_freq_hz).unwrap();
-    
     rx888_send_argument(&handle, ArgumentList::R82XX_ATTENUATOR, args.vhf_lna).unwrap();
     rx888_send_argument(&handle, ArgumentList::R82XX_VGA, args.vhf_vga).unwrap();
     rx888_send_argument(&handle, ArgumentList::DAT31_ATT, args.attenuation).unwrap();
     rx888_send_argument(&handle, ArgumentList::AD8340_VGA, (args.gain as u16) | 0x80).unwrap();
-
     rx888_send_command(&handle, FX3Command::STARTADC, args.sample_rate).unwrap();
     rx888_send_command(&handle, FX3Command::STARTFX3, 0).unwrap();
 
@@ -146,9 +143,10 @@ fn main() {
     let sample_rate = args.sample_rate as f64;
     let fft_norm_factor = (fft_size as f32).powi(2) * 0.15;
     
-    // To track where the IF hump actually is
     let mut wide_accumulator = vec![0.0f32; fft_size / 2];
     let mut wide_count = 0;
+    let start_time = Instant::now();
+    let mut auto_locked = false;
 
     while running.load(Ordering::SeqCst) {
         let mut data = transfer_pool.poll(Duration::from_secs(1)).expect("USB Timeout");
@@ -167,55 +165,69 @@ fn main() {
 
             wide_count += 1;
             for i in 0..(fft_size / 2) {
-                let p = buf[i].norm_sqr() / fft_norm_factor;
-                wide_accumulator[i] += p;
+                wide_accumulator[i] += buf[i].norm_sqr() / fft_norm_factor;
             }
 
-            for (freq_hz, state) in channel_map.iter_mut() {
-                let rel_offset = *freq_hz as f64 - center_freq_hz as f64;
-                let target_freq_in_baseband = (if_offset_hz + rel_offset).abs();
-                let bin_idx = (target_freq_in_baseband / (sample_rate / 2.0) * (fft_size as f64 / 2.0)) as usize;
-                if bin_idx < fft_size / 2 {
-                    state.accumulator += buf[bin_idx].norm_sqr() / fft_norm_factor;
-                    state.count += 1;
+            if auto_locked {
+                for (freq_hz, state) in channel_map.iter_mut() {
+                    let rel_offset = *freq_hz as f64 - center_freq_hz as f64;
+                    let target_freq = (current_if_hz + rel_offset).abs();
+                    let bin_idx = (target_freq / (sample_rate / 2.0) * (fft_size as f64 / 2.0)) as usize;
+                    if bin_idx < fft_size / 2 {
+                        state.accumulator += buf[bin_idx].norm_sqr() / fft_norm_factor;
+                        state.count += 1;
+                    }
                 }
             }
         }
 
         if last_ui_update.elapsed() >= Duration::from_millis(200) {
-            print!("\x1B[2J\x1B[H"); 
-            println!("=== RX888 Diagnostic Monitor ({:.3} - {:.3} MHz) ===", args.start_mhz, args.end_mhz);
-            
-            // Find Peak in wide spectrum to auto-detect IF location
+            // Find Peak to Auto-Lock
             let mut peaks: Vec<(usize, f32)> = wide_accumulator.iter().enumerate()
-                .skip(20) // skip DC spike
+                .skip(30) // skip DC
                 .map(|(i, &p)| (i, 10.0 * (p / wide_count as f32).log10()))
                 .collect();
             peaks.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
             
-            print!("Detected Peaks: ");
+            if !auto_locked && start_time.elapsed().as_secs() >= 2 {
+                if let Some((idx, _db)) = peaks.get(0) {
+                    current_if_hz = (*idx as f64 / (fft_size as f64 / 2.0)) * (sample_rate / 2.0);
+                    auto_locked = true;
+                }
+            }
+
+            print!("\x1B[2J\x1B[H"); 
+            println!("=== RX888 Auto-Locked Monitor ({:.3} - {:.3} MHz) ===", args.start_mhz, args.end_mhz);
+            
+            print!("Top Peaks: ");
             for (i, db) in peaks.iter().take(3) {
-                let freq = (*i as f64 / (fft_size as f64 / 2.0)) * (sample_rate / 2.0);
-                print!("| {:.2} MHz ({:.1} dB) ", freq / 1e6, db);
+                let f = (*i as f64 / (fft_size as f64 / 2.0)) * (sample_rate / 2.0);
+                print!("| {:.3} MHz ({:.1} dB) ", f / 1e6, db);
             }
             println!("|");
             
-            println!("Gains: LNA {} | VGA {} | PGA {} | IF: {:.1} MHz", args.vhf_lna, args.vhf_vga, args.gain, args.if_mhz);
+            println!("Status: {} | Current IF: {:.3} MHz", 
+                if auto_locked { "LOCKED" } else { "TUNING..." }, current_if_hz / 1e6);
             println!("{:-<110}", "");
 
-            let mut active_count = 0;
-            for (freq_hz, state) in channel_map.iter_mut() {
-                let db = if state.count > 0 { 10.0 * (state.accumulator / state.count as f32).log10() } else { -120.0 };
-                if db > args.threshold {
-                    active_count += 1;
-                    println!("{:>8.3} MHz: {:<48} {:>6.1} dB", *freq_hz as f64 / 1e6, power_to_dots(db), db);
+            if auto_locked {
+                let mut active_count = 0;
+                for (freq_hz, state) in channel_map.iter_mut() {
+                    let db = if state.count > 0 { 10.0 * (state.accumulator / state.count as f32).log10() } else { -120.0 };
+                    if db > args.threshold {
+                        active_count += 1;
+                        println!("{:>8.3} MHz: {:<48} {:>6.1} dB", *freq_hz as f64 / 1e6, power_to_dots(db), db);
+                    }
+                    state.accumulator = 0.0; state.count = 0;
                 }
-                state.accumulator = 0.0; state.count = 0;
+                if active_count == 0 { println!("\n(Listening... All channels below threshold)"); }
+            } else {
+                println!("\nPLEASE WAIT: Finding the hardware IF carrier...");
             }
-            if active_count == 0 { println!("\n(Scanning... Look at 'Detected Peaks' while someone is talking!)"); }
+            
             std::io::stdout().flush().unwrap();
             last_ui_update = Instant::now();
-            wide_accumulator.fill(0.0); wide_count = 0;
+            if !auto_locked { wide_accumulator.fill(0.0); wide_count = 0; }
         }
         transfer_pool.submit_bulk(0x81, data).unwrap();
     }
