@@ -3,12 +3,13 @@ use rx888_stream::rx888;
 use std::{
     collections::BTreeMap,
     fs::File,
+    io::{self, Write},
     path::PathBuf,
     sync::{Arc, atomic::{AtomicBool, Ordering}},
     thread,
     time::{Duration, Instant},
 };
-use bytemuck::{cast_slice, cast_slice_mut};
+use bytemuck::cast_slice;
 use clap::Parser;
 use rusb::{Context, UsbContext};
 use rustfft::{FftPlanner, num_complex::Complex};
