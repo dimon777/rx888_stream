@@ -28,19 +28,19 @@ struct Cli {
     #[arg(short = 's', long, default_value_t = 118.0)] start_mhz: f64,
     #[arg(short = 'e', long, default_value_t = 120.0)] end_mhz: f64,
     #[arg(short, long, default_value_t = 32000000)] sample_rate: u32,
-    #[arg(short, long, default_value_t = 30)] gain: u8,
-    #[arg(long, default_value_t = 10)] vhf_lna: u16,
-    #[arg(long, default_value_t = 5)] vhf_vga: u16,
-    #[arg(short, long, default_value_t = 20)] attenuation: u16,
+    #[arg(short, long, default_value_t = 60)] gain: u8,
+    #[arg(long, default_value_t = 29)] vhf_lna: u16, // Max LNA
+    #[arg(long, default_value_t = 15)] vhf_vga: u16, // Max VGA
+    #[arg(short, long, default_value_t = 0)] attenuation: u16, // No attenuation
     #[arg(short = 't', long, default_value_t = -95.0, allow_hyphen_values = true)] threshold: f32,
-    #[arg(short = 'i', long, default_value_t = 3.57)] if_mhz: f64,
+    #[arg(short = 'i', long, default_value_t = 10.4)] if_mhz: f64,
 }
 
 fn power_to_char(db: f32) -> char {
-    if db > -40.0 { '#' }
-    else if db > -60.0 { '=' }
-    else if db > -80.0 { '-' }
-    else if db > -95.0 { '.' }
+    if db > -30.0 { '#' }
+    else if db > -45.0 { '=' }
+    else if db > -60.0 { '-' }
+    else if db > -80.0 { '.' }
     else { ' ' }
 }
 
@@ -70,28 +70,26 @@ fn main() {
         curr_mhz += 0.025; 
     }
 
-    println!("[*] Synchronizing hardware...");
-    rx888_send_command(&handle, FX3Command::TUNERSTDBY, 0).expect("STDBY Fail");
-    thread::sleep(Duration::from_millis(100));
-    rx888_send_command(&handle, FX3Command::TUNERINIT, 0).expect("INIT Fail");
-    rx888_send_command_u64(&handle, FX3Command::TUNERTUNE, center_freq_hz).expect("TUNE Fail");
+    println!("[*] WAKING UP TUNER (MAX BOOST)...");
+    rx888_send_command(&handle, FX3Command::TUNERSTDBY, 0).ok();
+    thread::sleep(Duration::from_millis(200));
+    rx888_send_command(&handle, FX3Command::TUNERINIT, 0).ok();
+    rx888_send_command_u64(&handle, FX3Command::TUNERTUNE, center_freq_hz).ok();
     
+    // Explicit Gains
     rx888_send_argument(&handle, ArgumentList::R82XX_ATTENUATOR, args.vhf_lna).ok();
     rx888_send_argument(&handle, ArgumentList::R82XX_VGA, args.vhf_vga).ok();
     rx888_send_argument(&handle, ArgumentList::R82XX_SIDEBAND, 0).ok(); 
     rx888_send_argument(&handle, ArgumentList::R82XX_HARMONIC, 0).ok();
 
-    // Reverted GPIO to MINIMAL VHF_EN ONLY (Removing Bit 5/16 which caused the halt)
     let gpio = GPIOPin::VHF_EN as u32; 
-    rx888_send_command(&handle, FX3Command::GPIOFX3, gpio).expect("GPIO Fail");
+    rx888_send_command(&handle, FX3Command::GPIOFX3, gpio).ok();
 
-    rx888_send_argument(&handle, ArgumentList::DAT31_ATT, args.attenuation).expect("ATT Fail");
-    rx888_send_argument(&handle, ArgumentList::AD8340_VGA, (args.gain as u16) | 0x80).expect("VGA Fail");
+    rx888_send_argument(&handle, ArgumentList::DAT31_ATT, args.attenuation).ok();
+    rx888_send_argument(&handle, ArgumentList::AD8340_VGA, (args.gain as u16) | 0x80).ok();
 
-    rx888_send_command(&handle, FX3Command::STARTADC, args.sample_rate).expect("ADC_START Fail");
-    rx888_send_command(&handle, FX3Command::STARTFX3, 0).expect("FX3_START Fail");
-
-    println!("[*] Stream started. Waiting for data...");
+    rx888_send_command(&handle, FX3Command::STARTADC, args.sample_rate).ok();
+    rx888_send_command(&handle, FX3Command::STARTFX3, 0).ok();
 
     let handle_arc = Arc::new(handle);
     let mut transfer_pool = rusb_async::TransferPool::new(handle_arc.clone()).unwrap();
@@ -118,7 +116,7 @@ fn main() {
     let mut auto_locked = false;
 
     while running.load(Ordering::SeqCst) {
-        let mut data = transfer_pool.poll(Duration::from_secs(1)).expect("USB Timeout: Device stopped sending data");
+        let mut data = transfer_pool.poll(Duration::from_secs(1)).expect("USB Timeout");
         let samples: &[i16] = cast_slice(&data);
 
         for chunk in samples.chunks_exact(fft_size) {
@@ -128,10 +126,10 @@ fn main() {
             wide_cnt += 1;
             for (i, p) in wide_acc.iter_mut().enumerate() { *p += buf[i].norm_sqr() / fft_norm; }
             if auto_locked {
-                for (freq_hz, state) in channel_map.iter_mut() {
+                for (freq_hz, (acc, cnt)) in channel_map.iter_mut() {
                     let rel = *freq_hz as f64 - center_freq_hz as f64;
                     let bin = ((current_if_hz + rel).abs() / (sample_rate / 2.0) * (fft_size as f64 / 2.0)) as usize;
-                    if bin < fft_size / 2 { state.0 += buf[bin].norm_sqr() / fft_norm; state.1 += 1; }
+                    if bin < fft_size / 2 { *acc += buf[bin].norm_sqr() / fft_norm; *cnt += 1; }
                 }
             }
         }
@@ -146,24 +144,24 @@ fn main() {
             }
             
             print!("\x1B[2J\x1B[H");
-            println!("=== RX888 Rescued Monitor (Span: {:.1} MHz) ===", (args.end_mhz - args.start_mhz));
+            println!("=== RX888 BOOSTED MONITOR ({:.1} MHz) ===", (args.end_mhz - args.start_mhz));
             print!("0MHz [");
-            for i in 0..64 {
+            for i in 0..80 {
                 let mut max_db: f32 = -120.0;
-                let bs = i * (fft_size/2) / 64; let be = (i+1) * (fft_size/2) / 64;
+                let bs = i * (fft_size/2) / 80; let be = (i+1) * (fft_size/2) / 80;
                 for b in bs..be { if b < wide_acc.len() { max_db = max_db.max(10.0 * (wide_acc[b] / (wide_cnt as f32)).log10()); } }
                 print!("{}", power_to_char(max_db));
             }
             println!("] 16MHz");
-            println!("IF: {:.3} MHz | Status: {} | Peak: {:.1} dB", current_if_hz / 1e6, if auto_locked { "LOCKED" } else { "TUNING" }, pks[0].1);
+            println!("IF: {:.3} MHz | Status: {} | Peak: {:.1} dB", current_if_hz / 1e6, if auto_locked { "LOCKED" } else { "TUNING..." }, pks[0].1);
             println!("{:-<100}", "");
             if auto_locked {
-                for (f_hz, s) in channel_map.iter_mut() {
-                    let db = if s.1 > 0 { 10.0 * (s.0 / s.1 as f32).log10() } else { -120.0 };
+                for (f_hz, (acc, cnt)) in channel_map.iter_mut() {
+                    let db = if *cnt > 0 { 10.0 * (*acc / *cnt as f32).log10() } else { -120.0 };
                     if db > args.threshold {
                         println!("{:>8.3} MHz: {:<40} {:>5.1} dB", *f_hz as f64 / 1e6, ".".repeat(((db+110.0)*0.5).max(1.0).min(40.0) as usize), db);
                     }
-                    s.0 = 0.0; s.1 = 0;
+                    *acc = 0.0; *cnt = 0;
                 }
             }
             std::io::stdout().flush().ok();
