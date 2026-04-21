@@ -14,7 +14,6 @@ use std::{
 use bytemuck::{cast_slice, cast_slice_mut};
 use clap::Parser;
 use rusb::{Context, UsbContext};
-use rusb_async::TransferPool;
 use rustfft::{FftPlanner, num_complex::Complex};
 use rayon::prelude::*;
 
@@ -58,8 +57,8 @@ fn main() {
         }
     }
 
-    let h = open_device_with_timeout(&context, 0x04b4, 0x00f3, Duration::from_secs(5)).expect("No bootloader");
-    fx3::fx3_load_ram(h, &mut File::open(&args.firmware).unwrap()).unwrap();
+    let b_handle = open_device_with_timeout(&context, 0x04b4, 0x00f3, Duration::from_secs(5)).expect("No bootloader");
+    fx3::fx3_load_ram(b_handle, &mut File::open(&args.firmware).unwrap()).unwrap();
     thread::sleep(Duration::from_millis(1000));
     let handle = open_device_with_timeout(&context, 0x04b4, 0x00f1, Duration::from_secs(5)).unwrap();
     handle.claim_interface(0).unwrap();
@@ -73,7 +72,6 @@ fn main() {
         curr_mhz += 0.025; 
     }
 
-    // EXACT MATCH TO MAIN TOOL
     rx888_send_command(&handle, FX3Command::TUNERSTDBY, 0).ok();
     let mut gpio = GPIOPin::VHF_EN as u32 | GPIOPin::PGA_EN as u32;
     if args.randomize { gpio |= GPIOPin::RANDO as u32; }
@@ -89,8 +87,8 @@ fn main() {
     rx888_send_command(&handle, FX3Command::STARTADC, args.sample_rate).unwrap();
     rx888_send_command(&handle, FX3Command::STARTFX3, 0).unwrap();
 
-    let handle = Arc::new(handle);
-    let mut transfer_pool = rusb_async::TransferPool::new(handle.clone()).unwrap();
+    let handle_arc = Arc::new(handle);
+    let mut transfer_pool = rusb_async::TransferPool::new(handle_arc.clone()).unwrap();
     for _ in 0..64 { transfer_pool.submit_bulk(0x81, Vec::with_capacity(16384)).unwrap(); }
 
     let fft_size = 4096;
@@ -111,7 +109,7 @@ fn main() {
     let mut wide_acc = vec![0.0f32; fft_size / 2];
     let mut wide_cnt = 0;
     let start_time = Instant::now();
-    let mut auto_locked = (args.if_mhz != 0.0);
+    let mut auto_locked = args.if_mhz != 0.0;
 
     while running.load(Ordering::SeqCst) {
         let mut data = transfer_pool.poll(Duration::from_secs(1)).expect("USB Timeout");
@@ -150,13 +148,13 @@ fn main() {
             for i in 0..64 {
                 let bin_start = i * (fft_size / 2) / 64;
                 let bin_end = (i + 1) * (fft_size / 2) / 64;
-                let mut max_db = -120.0;
+                let mut max_db: f32 = -120.0;
                 for b in bin_start..bin_end { if b < wide_acc.len() { max_db = max_db.max(10.0 * (wide_acc[b] / wide_cnt as f32).log10()); } }
                 print!("{}", power_to_char(max_db));
             }
             println!("] 16MHz");
             
-            println!("IF: {:.3} MHz | Status: {} | Peaks: {:.2} ({:.1}dB)", current_if_hz / 1e6, if auto_locked { "LOCKED" } else { "TUNING" }, pks[0].0 as f32 * (sample_rate as f32 / 4096.0) / 1e6, pks[0].1);
+            println!("IF: {:.3} MHz | Status: {} | Peak: {:.2}MHz ({:.1}dB)", current_if_hz / 1e6, if auto_locked { "LOCKED" } else { "TUNING" }, pks[0].0 as f32 * (sample_rate as f32 / 4096.0) / 1e6, pks[0].1);
             println!("{:-<86}", "");
             if auto_locked {
                 for (f_hz, s) in channel_map.iter_mut() {
@@ -173,7 +171,7 @@ fn main() {
         }
         transfer_pool.submit_bulk(0x81, data).unwrap();
     }
-    rx888_send_command(handle.as_ref(), FX3Command::STOPFX3, 0).ok();
+    rx888_send_command(handle_arc.as_ref(), FX3Command::STOPFX3, 0).ok();
 }
 
 fn open_device_with_timeout(ctx: &rusb::Context, vid: u16, pid: u16, timeout: Duration) -> Option<rusb::DeviceHandle<rusb::Context>> {
