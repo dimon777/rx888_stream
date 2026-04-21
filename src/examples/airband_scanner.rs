@@ -444,10 +444,10 @@ fn scanner_loop(
     let n_ch = channels_hz.len();
     let window = build_hann_window(FFT_SIZE);
 
-    // Pre-compute the FFT bin and bucket half-width for every channel.
-    // Bucket half-width: cover ±12.5 kHz (one channel radius) in bins.
+    // Bucket radius: 6 kHz (covers the AM signal but avoids the 12.5 kHz DC offset)
     let hz_per_bin = SAMPLE_RATE as f64 / FFT_SIZE as f64;
-    let half_width_bins = ((CHANNEL_STEP_HZ as f64 / 2.0) / hz_per_bin).ceil() as usize;
+    let bucket_radius_hz = 6000.0;
+    let half_width_bins = (bucket_radius_hz / hz_per_bin).ceil() as usize;
 
     let bins: Vec<usize> = channels_hz
         .iter()
@@ -619,11 +619,9 @@ fn main() {
 
     let channels_mhz: Vec<f64> = channels_hz.iter().map(|&h| h as f64 / 1e6).collect();
 
-    // ── 3. Tune to centre of requested span ───────────────────────────────────
-    // Avoid placing DC exactly on a channel by rounding centre to the nearest
-    // 100 kHz boundary (keeps DC artefact between channels).
-    let raw_center = (start_hz + end_hz) / 2;
-    let center_hz = (raw_center / 100_000) * 100_000;
+    // Offset the LO by 12.5 kHz to ensure the DC spike (at 0 Hz baseband) 
+    // lands exactly between 25 kHz channel boundaries.
+    let center_hz = ((start_hz + end_hz) / 2 / 25_000) * 25_000 + 12_500;
 
     print_header(args.start, args.end, center_hz as f64 / 1e6, channels_hz.len());
 
